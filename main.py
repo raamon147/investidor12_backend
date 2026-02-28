@@ -4,33 +4,41 @@ import requests
 import yfinance as yf
 import pandas as pd
 import math
+import hashlib
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Float, Date, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-from datetime import date
+from sqlalchemy.orm import sessionmaker, Session, relationship
+from datetime import date, datetime, timedelta
 from typing import List, Optional
 
-# --- CONFIGURAÇÃO DO BANCO DE DADOS (PostgreSQL ou SQLite) ---
-# Vai buscar o URL ao Render. Se não existir, usa SQLite localmente.
+# --- CONFIGURAÇÃO DO BANCO DE DADOS ---
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./meu_patrimonio_v2.db")
-
-# O SQLAlchemy exige "postgresql://" mas algumas plataformas dão "postgres://"
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Argumentos de conexão (SQLite precisa de check_same_thread, Postgres não aceita isso)
 connect_args = {"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
-
 engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+# --- SEGURANÇA (Hash de Senhas) ---
+def hash_password(password: str):
+    return hashlib.sha256(password.encode() + b"investidor12_salt").hexdigest()
+
+# --- MODELOS DO BANCO ---
+class UserDB(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    password = Column(String)
+
 class WalletDB(Base):
     __tablename__ = "wallets"
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False) # Vinculo com o usuário
     name = Column(String, index=True)
     description = Column(String, nullable=True)
 
@@ -46,7 +54,13 @@ class TransactionDB(Base):
 
 Base.metadata.create_all(bind=engine)
 
+# --- SCHEMAS ---
+class UserAuth(BaseModel):
+    username: str
+    password: str
+
 class WalletCreate(BaseModel):
+    user_id: int
     name: str
     description: Optional[str] = None
 
@@ -60,7 +74,6 @@ class TransactionCreate(BaseModel):
 
 app = FastAPI(title="Investidor12 API")
 
-# Permite que o Vercel comunique com esta API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -108,22 +121,51 @@ def get_divs_sync(ticker):
     except: return ticker, None
 
 @app.get("/")
-def read_root():
-    return {"status": "API Investidor12 Online"}
+def read_root(): return {"status": "API Investidor12 Online"}
 
+# --- ROTAS DE AUTENTICAÇÃO ---
+@app.post("/auth/register")
+def register(user: UserAuth, db: Session = Depends(get_db)):
+    existing = db.query(UserDB).filter(UserDB.username == user.username.lower()).first()
+    if existing: raise HTTPException(status_code=400, detail="Usuário já existe")
+    
+    new_user = UserDB(username=user.username.lower(), password=hash_password(user.password))
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    # Cria a carteira padrão do usuário novo
+    def_wallet = WalletDB(name="Carteira Principal", user_id=new_user.id)
+    db.add(def_wallet)
+    db.commit()
+    
+    return {"id": new_user.id, "username": new_user.username}
+
+@app.post("/auth/login")
+def login(user: UserAuth, db: Session = Depends(get_db)):
+    db_user = db.query(UserDB).filter(
+        UserDB.username == user.username.lower(), 
+        UserDB.password == hash_password(user.password)
+    ).first()
+    
+    if not db_user: raise HTTPException(status_code=400, detail="Credenciais inválidas")
+    return {"id": db_user.id, "username": db_user.username}
+
+# --- ROTAS DA API ---
 @app.post("/wallets/")
 def create_wallet(wallet: WalletCreate, db: Session = Depends(get_db)):
-    db_wallet = WalletDB(name=wallet.name, description=wallet.description)
+    db_wallet = WalletDB(name=wallet.name, description=wallet.description, user_id=wallet.user_id)
     db.add(db_wallet)
     db.commit()
     db.refresh(db_wallet)
     return db_wallet
 
 @app.get("/wallets/")
-def list_wallets(db: Session = Depends(get_db)):
-    wallets = db.query(WalletDB).all()
+def list_wallets(user_id: int, db: Session = Depends(get_db)):
+    wallets = db.query(WalletDB).filter(WalletDB.user_id == user_id).all()
+    # Se por acaso o usuário não tiver carteira, criamos uma na hora
     if not wallets:
-        def_wallet = WalletDB(name="Carteira Principal", description="Padrão")
+        def_wallet = WalletDB(name="Carteira Principal", user_id=user_id)
         db.add(def_wallet)
         db.commit()
         db.refresh(def_wallet)
@@ -177,48 +219,30 @@ def update_trans(id: int, trans: TransactionCreate, db: Session = Depends(get_db
 def price_check(ticker: str, date: str):
     ticker_upper = ticker.upper()
     try:
-        # Garante que a data seja interpretada corretamente
-        if "-" in date:
-            target_date = datetime.strptime(date, "%Y-%m-%d").date()
+        if "-" in date: target_date = datetime.strptime(date, "%Y-%m-%d").date()
         elif "/" in date: 
             d, m, y = date.split("/")
             target_date = datetime(int(y), int(m), int(d)).date()
-        else:
-            target_date = datetime.now().date()
+        else: target_date = datetime.now().date()
             
         hoje = datetime.now().date()
-        
-        # Se a data for hoje ou no futuro, pega a cotação em tempo real
         if target_date >= hoje:
             _, p = get_realtime_price_sync(ticker_upper)
             return {"price": round(p, 2)}
             
-        # Busca no histórico usando yf.download (muito mais robusto para o passado)
         start_str = target_date.strftime("%Y-%m-%d")
-        # Damos uma janela de 7 dias úteis caso a data caia num feriado prolongado
         end_date = target_date + timedelta(days=7)
         end_str = end_date.strftime("%Y-%m-%d")
         
         df = yf.download(ticker_upper, start=start_str, end=end_str, progress=False, threads=False)
-        
         if not df.empty and 'Close' in df:
             close_data = df['Close']
-            
-            # O yfinance novo pode retornar MultiIndex, então tratamos os dois casos
-            if isinstance(close_data, pd.DataFrame):
-                p = close_data.iloc[0, 0]
-            else:
-                p = close_data.iloc[0]
+            p = close_data.iloc[0, 0] if isinstance(close_data, pd.DataFrame) else close_data.iloc[0]
+            if pd.notna(p) and p > 0: return {"price": round(safe_float(p), 2)}
                 
-            if pd.notna(p) and p > 0:
-                return {"price": round(safe_float(p), 2)}
-                
-        # Se a API da bolsa realmente falhar, usa o fallback de segurança
         _, p = get_realtime_price_sync(ticker_upper)
         return {"price": round(p, 2)}
-        
     except Exception as e:
-        print(f"Erro ao buscar preco historico para {ticker_upper} em {date}: {e}")
         _, p = get_realtime_price_sync(ticker_upper)
         return {"price": round(p, 2)}
 
