@@ -175,8 +175,37 @@ def update_trans(id: int, trans: TransactionCreate, db: Session = Depends(get_db
 
 @app.get("/get-price")
 def price_check(ticker: str, date: str):
-    t, p = get_realtime_price_sync(ticker.upper())
-    return {"price": round(p, 2)}
+    ticker_upper = ticker.upper()
+    try:
+        # Converte a string YYYY-MM-DD do frontend para objeto Date
+        target_date = datetime.strptime(date, "%Y-%m-%d").date()
+        hoje = datetime.now().date()
+        
+        # Se a data for hoje ou no futuro, pega a cotação em tempo real
+        if target_date >= hoje:
+            _, p = get_realtime_price_sync(ticker_upper)
+            return {"price": round(p, 2)}
+            
+        # Se for data no passado, busca o histórico no Yahoo Finance
+        # Damos uma janela de 5 dias úteis caso a data caia num sábado/domingo/feriado
+        next_days = target_date + timedelta(days=5)
+        
+        t = yf.Ticker(ticker_upper)
+        h = t.history(start=target_date.strftime("%Y-%m-%d"), end=next_days.strftime("%Y-%m-%d"))
+        
+        if not h.empty:
+            # Pega o preço de fechamento do primeiro dia útil daquela janela
+            p = safe_float(h['Close'].iloc[0])
+            return {"price": round(p, 2)}
+            
+        # Fallback de segurança caso a API do Yahoo falhe
+        _, p = get_realtime_price_sync(ticker_upper)
+        return {"price": round(p, 2)}
+        
+    except Exception as e:
+        print(f"Erro ao buscar preço histórico para {ticker_upper} em {date}: {e}")
+        _, p = get_realtime_price_sync(ticker_upper)
+        return {"price": round(p, 2)}
 
 @app.get("/earnings")
 def get_earnings(wallet_id: int, db: Session = Depends(get_db)):
