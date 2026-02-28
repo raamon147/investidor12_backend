@@ -177,8 +177,15 @@ def update_trans(id: int, trans: TransactionCreate, db: Session = Depends(get_db
 def price_check(ticker: str, date: str):
     ticker_upper = ticker.upper()
     try:
-        # Converte a string YYYY-MM-DD do frontend para objeto Date
-        target_date = datetime.strptime(date, "%Y-%m-%d").date()
+        # Garante que a data seja interpretada corretamente
+        if "-" in date:
+            target_date = datetime.strptime(date, "%Y-%m-%d").date()
+        elif "/" in date: 
+            d, m, y = date.split("/")
+            target_date = datetime(int(y), int(m), int(d)).date()
+        else:
+            target_date = datetime.now().date()
+            
         hoje = datetime.now().date()
         
         # Se a data for hoje ou no futuro, pega a cotação em tempo real
@@ -186,24 +193,32 @@ def price_check(ticker: str, date: str):
             _, p = get_realtime_price_sync(ticker_upper)
             return {"price": round(p, 2)}
             
-        # Se for data no passado, busca o histórico no Yahoo Finance
-        # Damos uma janela de 5 dias úteis caso a data caia num sábado/domingo/feriado
-        next_days = target_date + timedelta(days=5)
+        # Busca no histórico usando yf.download (muito mais robusto para o passado)
+        start_str = target_date.strftime("%Y-%m-%d")
+        # Damos uma janela de 7 dias úteis caso a data caia num feriado prolongado
+        end_date = target_date + timedelta(days=7)
+        end_str = end_date.strftime("%Y-%m-%d")
         
-        t = yf.Ticker(ticker_upper)
-        h = t.history(start=target_date.strftime("%Y-%m-%d"), end=next_days.strftime("%Y-%m-%d"))
+        df = yf.download(ticker_upper, start=start_str, end=end_str, progress=False, threads=False)
         
-        if not h.empty:
-            # Pega o preço de fechamento do primeiro dia útil daquela janela
-            p = safe_float(h['Close'].iloc[0])
-            return {"price": round(p, 2)}
+        if not df.empty and 'Close' in df:
+            close_data = df['Close']
             
-        # Fallback de segurança caso a API do Yahoo falhe
+            # O yfinance novo pode retornar MultiIndex, então tratamos os dois casos
+            if isinstance(close_data, pd.DataFrame):
+                p = close_data.iloc[0, 0]
+            else:
+                p = close_data.iloc[0]
+                
+            if pd.notna(p) and p > 0:
+                return {"price": round(safe_float(p), 2)}
+                
+        # Se a API da bolsa realmente falhar, usa o fallback de segurança
         _, p = get_realtime_price_sync(ticker_upper)
         return {"price": round(p, 2)}
         
     except Exception as e:
-        print(f"Erro ao buscar preço histórico para {ticker_upper} em {date}: {e}")
+        print(f"Erro ao buscar preco historico para {ticker_upper} em {date}: {e}")
         _, p = get_realtime_price_sync(ticker_upper)
         return {"price": round(p, 2)}
 
