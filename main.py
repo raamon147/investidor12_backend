@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Float, Date, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, relationship
+from sqlalchemy.orm import sessionmaker, Session
 from datetime import date, datetime, timedelta
 from typing import List, Optional
 
@@ -24,11 +24,10 @@ engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- SEGURANÇA (Hash de Senhas) ---
+# --- SEGURANÇA ---
 def hash_password(password: str):
     return hashlib.sha256(password.encode() + b"investidor12_salt").hexdigest()
 
-# --- MODELOS DO BANCO ---
 class UserDB(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -38,7 +37,7 @@ class UserDB(Base):
 class WalletDB(Base):
     __tablename__ = "wallets"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False) # Vinculo com o usuário
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     name = Column(String, index=True)
     description = Column(String, nullable=True)
 
@@ -54,7 +53,6 @@ class TransactionDB(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# --- SCHEMAS ---
 class UserAuth(BaseModel):
     username: str
     password: str
@@ -123,7 +121,6 @@ def get_divs_sync(ticker):
 @app.get("/")
 def read_root(): return {"status": "API Investidor12 Online"}
 
-# --- ROTAS DE AUTENTICAÇÃO ---
 @app.post("/auth/register")
 def register(user: UserAuth, db: Session = Depends(get_db)):
     existing = db.query(UserDB).filter(UserDB.username == user.username.lower()).first()
@@ -134,7 +131,6 @@ def register(user: UserAuth, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_user)
     
-    # Cria a carteira padrão do usuário novo
     def_wallet = WalletDB(name="Carteira Principal", user_id=new_user.id)
     db.add(def_wallet)
     db.commit()
@@ -151,7 +147,6 @@ def login(user: UserAuth, db: Session = Depends(get_db)):
     if not db_user: raise HTTPException(status_code=400, detail="Credenciais inválidas")
     return {"id": db_user.id, "username": db_user.username}
 
-# --- ROTAS DA API ---
 @app.post("/wallets/")
 def create_wallet(wallet: WalletCreate, db: Session = Depends(get_db)):
     db_wallet = WalletDB(name=wallet.name, description=wallet.description, user_id=wallet.user_id)
@@ -163,7 +158,6 @@ def create_wallet(wallet: WalletCreate, db: Session = Depends(get_db)):
 @app.get("/wallets/")
 def list_wallets(user_id: int, db: Session = Depends(get_db)):
     wallets = db.query(WalletDB).filter(WalletDB.user_id == user_id).all()
-    # Se por acaso o usuário não tiver carteira, criamos uma na hora
     if not wallets:
         def_wallet = WalletDB(name="Carteira Principal", user_id=user_id)
         db.add(def_wallet)
@@ -171,6 +165,14 @@ def list_wallets(user_id: int, db: Session = Depends(get_db)):
         db.refresh(def_wallet)
         return [def_wallet]
     return wallets
+
+# --- NOVA ROTA: EXCLUIR CARTEIRA ---
+@app.delete("/wallets/{id}")
+def delete_wallet(id: int, db: Session = Depends(get_db)):
+    db.query(TransactionDB).filter(TransactionDB.wallet_id == id).delete()
+    db.query(WalletDB).filter(WalletDB.id == id).delete()
+    db.commit()
+    return {"message": "Carteira e ativos excluídos com sucesso"}
 
 @app.post("/transactions/")
 def create_transaction(trans: TransactionCreate, db: Session = Depends(get_db)):
@@ -397,16 +399,19 @@ def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
             if custo > 0:
                 val_mercado = 0
                 try:
-                    if len(tickers) == 1: 
-                        p = safe_float(hist_slice.loc[ts]) if tickers[0] in str(hist_slice.name) else 0
-                        if p > 0: val_mercado = posicao[tickers[0]] * p
-                    else:
-                        row = hist_slice.loc[ts]
+                    # CORREÇÃO DEFINITIVA DO BUG DE RENTABILIDADE
+                    row = hist_slice.loc[ts]
+                    if isinstance(hist_slice, pd.DataFrame):
                         for t, q in posicao.items():
                             if q > 0 and t in row:
                                 p = safe_float(row[t])
                                 if p > 0: val_mercado += q * p
-                except: pass
+                    elif isinstance(hist_slice, pd.Series):
+                        p = safe_float(row)
+                        for t, q in posicao.items():
+                            if q > 0 and p > 0: val_mercado += q * p
+                except Exception as e:
+                    pass
                 
                 if val_mercado == 0: val_mercado = custo
                 rent_cart = ((val_mercado - custo) / custo * 100)
