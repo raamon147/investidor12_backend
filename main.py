@@ -425,14 +425,60 @@ def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
 
     return {"patrimonio_atual": safe_float(round(patrimonio_total, 2)), "total_investido": safe_float(round(investido_total, 2)), "lucro": safe_float(round(lucro, 2)), "rentabilidade_pct": safe_float(round(rent_total, 2)), "daily_variation": safe_float(round(daily_pct, 2)), "grafico": chart_data, "ativos": ativos_finais}
 
-# --- NOVA ROTA: EXPLORAR ATIVOS ---
+# --- NOVA ROTA: PANORAMA DO MERCADO ---
+@app.get("/market-overview")
+def market_overview():
+    baskets = {
+        "Ações (B3)": ['PETR4.SA', 'VALE3.SA', 'ITUB4.SA', 'BBDC4.SA', 'BBAS3.SA', 'WEGE3.SA', 'ELET3.SA', 'RENT3.SA'],
+        "FIIs (B3)": ['MXRF11.SA', 'HGLG11.SA', 'KNRI11.SA', 'CPTS11.SA', 'BTLG11.SA', 'VGHF11.SA', 'XPML11.SA'],
+        "Stocks (EUA)": ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META'],
+        "Criptomoedas": ['BTC-USD', 'ETH-USD', 'SOL-USD', 'BNB-USD']
+    }
+    all_tickers = []
+    for t_list in baskets.values(): all_tickers.extend(t_list)
+
+    try:
+        df = yf.download(all_tickers, period="5d", progress=False, threads=False)
+        if 'Close' in df: close_df = df['Close']
+        else: close_df = df
+
+        results = {}
+        for category, tickers in baskets.items():
+            cat_data = []
+            prefix = "US$ " if "EUA" in category or "Cripto" in category else "R$ "
+            
+            for t in tickers:
+                try:
+                    if t in close_df.columns:
+                        s = close_df[t].dropna()
+                        if len(s) >= 2:
+                            current = safe_float(s.iloc[-1])
+                            prev = safe_float(s.iloc[-2])
+                            if prev > 0:
+                                var_pct = ((current - prev) / prev) * 100
+                                cat_data.append({
+                                    "ticker": t.replace('.SA', ''),
+                                    "price": current,
+                                    "variation": var_pct,
+                                    "currency": prefix
+                                })
+                except: pass
+            
+            cat_data.sort(key=lambda x: x['variation'], reverse=True)
+            results[category] = cat_data[:5]
+        return results
+    except Exception as e:
+        print("Erro Panorama:", e)
+        return {k: [] for k in baskets.keys()}
+
+
+# --- CORREÇÃO DO CÁLCULO DE DY ---
 @app.get("/asset-details/{ticker}")
 def get_asset_details(ticker: str):
     ticker_upper = ticker.upper().strip()
     clean_ticker = ticker_upper.replace('.SA', '')
     
-    # Validação básica para adicionar .SA caso seja ação brasileira
-    if not ticker_upper.endswith('.SA') and not ticker_upper.isalpha():
+    if not ticker_upper.endswith('.SA') and not ticker_upper.isalpha() and '-' not in ticker_upper:
         ticker_upper += '.SA'
 
     try:
@@ -440,44 +486,36 @@ def get_asset_details(ticker: str):
         info = t.info
         
         if not info or ('regularMarketPrice' not in info and 'currentPrice' not in info and 'previousClose' not in info):
-             raise HTTPException(status_code=404, detail="Ativo não encontrado na base de dados.")
+             raise HTTPException(status_code=404, detail="Ativo não encontrado.")
 
-        # 1. Pegar histórico de preços de 1 ano
+        # 1. Gráfico de Preço (1 Ano)
         hist = t.history(period="1y")
         chart_data = []
         current_price = 0
         if not hist.empty:
             current_price = safe_float(hist['Close'].iloc[-1])
             for dt, row in hist.iterrows():
-                chart_data.append({
-                    "date": dt.strftime("%d/%m/%y"),
-                    "price": safe_float(row['Close'])
-                })
+                chart_data.append({"date": dt.strftime("%d/%m/%y"), "price": safe_float(row['Close'])})
         
         if current_price == 0:
             current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
 
-        # 2. Pegar Dividendos (Histórico e Futuros)
+        # 2. Histórico de Dividendos
         divs = t.dividends
         div_history = []
         upcoming_divs = []
         
         if not divs.empty:
-            if divs.index.tz is not None: 
-                divs.index = divs.index.tz_localize(None)
-            
+            if divs.index.tz is not None: divs.index = divs.index.tz_localize(None)
             hoje = datetime.now()
-            start_date = hoje - timedelta(days=365 * 2) # Últimos 2 anos para o gráfico
+            start_date = hoje - timedelta(days=365 * 2) 
             
             for d, val in divs.items():
                 if d >= start_date:
                     obj = {"date": d.strftime("%Y-%m-%d"), "value": safe_float(val)}
-                    if d > hoje:
-                        upcoming_divs.append(obj)
-                    else:
-                        div_history.append(obj)
+                    if d > hoje: upcoming_divs.append(obj)
+                    else: div_history.append(obj)
 
-        # Agrupar dividendos por Mês/Ano para o gráfico
         div_chart_map = {}
         for d in div_history:
             y, m, _ = d['date'].split('-')
@@ -486,11 +524,17 @@ def get_asset_details(ticker: str):
             
         div_chart = [{"mes": k, "valor": safe_float(v)} for k, v in div_chart_map.items()]
 
-        # Calcular DY alternativo se a API não entregar
-        dy = safe_float(info.get("dividendYield", info.get("trailingAnnualDividendYield", 0))) * 100
-        if dy == 0 and current_price > 0 and div_chart_map:
-            # Soma dos ultimos 12 meses aproximada
-            dy = (sum(div_chart_map.values()) / current_price) * 100
+        # 3. Matemática Correta do DY (Impede que 7.79 vire 779%)
+        dy = safe_float(info.get("dividendYield", info.get("trailingAnnualDividendYield", 0)))
+        if dy > 0:
+            dy = dy * 100 if dy < 1 else dy # Se for 0.07, vira 7%. Se a API mandar 7.0, mantem 7%.
+        else:
+            # Fallback manual restrito aos ultimos 12 meses EXATOS
+            if current_price > 0 and div_history:
+                hoje = datetime.now()
+                um_ano_atras = hoje - timedelta(days=365)
+                soma_12m = sum(d['value'] for d in div_history if datetime.strptime(d['date'], "%Y-%m-%d") >= um_ano_atras)
+                dy = (soma_12m / current_price) * 100
 
         return {
             "ticker": clean_ticker,
@@ -507,7 +551,7 @@ def get_asset_details(ticker: str):
                 "low52w": safe_float(info.get("fiftyTwoWeekLow", 0)),
             },
             "chart": chart_data,
-            "dividends_chart": div_chart[-12:], # Mostra apenas os ultimos 12 meses com pagamento
+            "dividends_chart": div_chart[-12:], 
             "upcoming_dividends": upcoming_divs
         }
     except Exception as e:
