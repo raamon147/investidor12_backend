@@ -47,9 +47,7 @@ def safe_float(val):
         return float(val) if not math.isnan(float(val)) else 0.0
     except: return 0.0
 
-# === SISTEMA DE CACHE INTELIGENTE PARA EVITAR RATE LIMIT ===
-# O cache expira a cada 15 minutos (900 segundos). Isso salva o servidor de bloqueios!
-@functools.lru_cache(maxsize=128)
+@functools.lru_cache(maxsize=256)
 def _get_cached_price(ticker: str, cache_buster: int):
     try:
         h = yf.Ticker(ticker).history(period="5d")
@@ -64,8 +62,7 @@ def _get_cached_price(ticker: str, cache_buster: int):
     return ticker, 0.0, 0.0
 
 def get_fast_price_var(ticker):
-    # O cache_buster garante que a chave do cache mude a cada 15 minutos
-    cache_buster = int(time.time() / 900)
+    cache_buster = int(time.time() / 600)
     return _get_cached_price(ticker, cache_buster)
 
 def fetch_prices_sync(tickers):
@@ -75,7 +72,71 @@ def fetch_prices_sync(tickers):
             res[tick] = p
     return res
 
-# === POPULAR BANCO DE DADOS NA INICIALIZAÇÃO ===
+# =====================================================================
+# NOVO MOTOR HÍBRIDO DE DIVIDENDOS (API NOVA + YFINANCE)
+# =====================================================================
+def fetch_dividends_hybrid(ticker: str):
+    full_history_list = []
+    hoje = datetime.now()
+    start_date = hoje - timedelta(days=365 * 2) # Últimos 2 anos
+    
+    # 1. TENTA A API NOVA (Com Data de Pagamento Real)
+    try:
+        # A API pode precisar do ticker limpo ou com .SA, tentamos o formato limpo primeiro
+        clean_ticker = ticker.replace('.SA', '')
+        url = f"https://api.massive.com/stocks/v1/dividends?ticker={clean_ticker}&limit=100&apiKey=Z2ypGUiDHCz4iiykpfLd8bvZ0VppJ3uO"
+        res = requests.get(url, timeout=4)
+        
+        if res.status_code == 200:
+            data = res.json()
+            # Descobre onde os dados estão no JSON (results, data ou na raiz)
+            items = data.get('results', data.get('data', data if isinstance(data, list) else []))
+            
+            for item in items:
+                ex_date_str = item.get('exDate', item.get('ex_date', item.get('date', '')))
+                pay_date_str = item.get('paymentDate', item.get('pay_date', item.get('payment_date', ex_date_str)))
+                amount = safe_float(item.get('amount', item.get('cash_amount', item.get('rate', 0))))
+
+                if ex_date_str and amount > 0:
+                    ex_date_obj = datetime.strptime(ex_date_str[:10], "%Y-%m-%d")
+                    if ex_date_obj >= start_date:
+                        pay_date_obj = datetime.strptime(pay_date_str[:10], "%Y-%m-%d") if pay_date_str else ex_date_obj
+                        status = "A RECEBER" if pay_date_obj > hoje else "RECEBIDO"
+                        
+                        full_history_list.append({
+                            "ex_date": ex_date_str[:10],
+                            "pay_date": pay_date_str[:10],
+                            "value": amount,
+                            "status": status
+                        })
+            
+            # Se a API retornou dados com sucesso, ordenamos e devolvemos!
+            if full_history_list:
+                return sorted(full_history_list, key=lambda x: x['pay_date'], reverse=True)
+    except Exception as e:
+        print(f"Aviso: API Nova falhou para {ticker}. Usando YFinance. Erro: {e}")
+
+    # 2. FALLBACK PARA O YFINANCE (Garante que nunca quebra)
+    try:
+        divs = yf.Ticker(ticker).dividends
+        if not divs.empty:
+            if divs.index.tz is not None: divs.index = divs.index.tz_localize(None)
+            for d, val in divs.items():
+                if d >= start_date:
+                    d_str = d.strftime("%Y-%m-%d")
+                    status = "A RECEBER" if d > hoje else "RECEBIDO"
+                    full_history_list.append({
+                        "ex_date": d_str,  # YFinance só tem ex-date, então duplicamos
+                        "pay_date": d_str,
+                        "value": safe_float(val),
+                        "status": status
+                    })
+    except: pass
+    
+    return sorted(full_history_list, key=lambda x: x['pay_date'], reverse=True)
+# =====================================================================
+
+
 @app.on_event("startup")
 def seed_database():
     db = next(get_db())
@@ -84,7 +145,6 @@ def seed_database():
         db.add(SystemConfigDB(key_name="mamutes", config_data=json.dumps(mamutes)))
         
     if not db.query(SystemConfigDB).filter(SystemConfigDB.key_name == "market_indices").first():
-        # Lista LIMPA (Tirei os ativos deslistados/problemáticos do seu log)
         indices = {
             "IBOV": [f"{t}.SA" for t in ["VALE3", "PETR4", "ITUB4", "BBDC4", "B3SA3", "BBAS3", "ITSA4", "ABEV3", "PRIO3", "RENT3", "GGBR4", "WEGE3", "MGLU3", "HAPV3", "JBSS3", "SUZB3", "BPAC11", "LREN3", "ELET3", "RDOR3", "EQTL3", "RAIL3", "CSNA3", "VIVT3", "RADL3", "ASAI3", "UGPA3", "GOAU4", "BBSE3", "CMIG4", "COGN3", "CPFE3", "CYRE3", "EGIE3", "ENGI11", "GMAT3", "SBSP3", "TOTS3", "USIM5", "VBBR3", "KLBN11", "TIMS3", "BRAP4", "MULT3"]],
             "IFIX": [f"{t}.SA" for t in ["MXRF11", "XPML11", "KNCR11", "HGLG11", "BTLG11", "VISC11", "CPTS11", "HGBS11", "TGAR11", "IRDM11", "XPLG11", "KNIP11", "RBRR11", "JSRE11", "PVBI11", "BRCO11", "GARE11", "TRXF11", "LVBI11", "VGIR11", "KNSC11", "RECR11", "HGRU11", "VINO11", "MCCI11", "ALZR11", "VRTA11", "GGRC11", "RBRP11", "OUJP11", "HGPO11", "HGRE11", "RZTR11", "BTRA11", "RZAK11", "RBRL11", "PATL11", "KNHY11", "RBVA11", "BTAL11", "HABT11", "BROF11", "KFOF11", "BPML11", "VILG11"]],
@@ -98,9 +158,8 @@ def seed_database():
     db.commit()
 
 @app.get("/")
-def read_root(): return {"status": "API Investidor12 Online e Modularizada"}
+def read_root(): return {"status": "API Investidor12 Online"}
 
-# === ROTAS DE WATCHLIST ===
 @app.get("/watchlists/")
 def get_watchlists(user_id: int, db: Session = Depends(get_db)):
     watchlists = db.query(WatchlistDB).filter(WatchlistDB.user_id == user_id).all()
@@ -108,7 +167,6 @@ def get_watchlists(user_id: int, db: Session = Depends(get_db)):
     
     all_tickers = list(set([item.ticker for w in watchlists for item in w.items]))
     prices = {}
-    # Busca paralela em cache
     with ThreadPoolExecutor(max_workers=10) as executor:
         for ticker, price, var in executor.map(get_fast_price_var, all_tickers):
             prices[ticker] = {"price": price, "variation": var}
@@ -133,7 +191,11 @@ def delete_watchlist(id: int, db: Session = Depends(get_db)):
 @app.post("/watchlists/{id}/items")
 def add_watchlist_item(id: int, item: WatchlistItemCreate, db: Session = Depends(get_db)):
     clean_ticker = item.ticker.upper().strip()
-    if not db.query(WatchlistItemDB).filter(WatchlistItemDB.watchlist_id == id, WatchlistItemDB.ticker == clean_ticker).first():
+    if not clean_ticker.endswith('.SA') and not '-' in clean_ticker:
+        if any(char.isdigit() for char in clean_ticker): clean_ticker += '.SA'
+
+    existing = db.query(WatchlistItemDB).filter(WatchlistItemDB.watchlist_id == id, WatchlistItemDB.ticker == clean_ticker).first()
+    if not existing:
         db.add(WatchlistItemDB(watchlist_id=id, ticker=clean_ticker)); db.commit()
     return {"message": "Adicionado"}
 
@@ -141,7 +203,6 @@ def add_watchlist_item(id: int, item: WatchlistItemCreate, db: Session = Depends
 def delete_watchlist_item(item_id: int, db: Session = Depends(get_db)):
     db.query(WatchlistItemDB).filter(WatchlistItemDB.id == item_id).delete(); db.commit(); return {"message": "Removido"}
 
-# === PANORAMA DE MERCADO (COM CACHE E BLINDADO) ===
 @app.get("/market-overview")
 def market_overview(db: Session = Depends(get_db)):
     try:
@@ -153,7 +214,6 @@ def market_overview(db: Session = Depends(get_db)):
         all_tickers = list(set(all_tickers))
             
         prices = {}
-        # Busca individual com CACHE! Isso zera as requisições massivas pro Yahoo e impede o bloqueio!
         with ThreadPoolExecutor(max_workers=20) as executor:
             for ticker, price, var in executor.map(get_fast_price_var, all_tickers):
                 prices[ticker] = {"price": price, "variation": var}
@@ -176,7 +236,175 @@ def market_overview(db: Session = Depends(get_db)):
         print(f"Erro Overview: {e}")
         return {}
 
-# === DASHBOARD CORRIGIDO ===
+# === EXPLORAR ATIVOS COM O NOVO MOTOR DE DIVIDENDOS ===
+@app.get("/asset-details/{ticker}")
+def get_asset_details(ticker: str):
+    ticker_upper = ticker.upper().strip()
+    clean_ticker = ticker_upper.replace('.SA', '')
+    
+    if not ticker_upper.endswith('.SA') and not '-' in ticker_upper:
+        if any(char.isdigit() for char in ticker_upper): ticker_upper += '.SA'
+
+    try:
+        t = yf.Ticker(ticker_upper)
+        
+        hist = t.history(period="1y")
+        if hist.empty: raise HTTPException(status_code=404, detail="Ativo não encontrado ou sem dados na B3.")
+
+        chart_data = [{"date": dt.strftime("%d/%m/%y"), "price": safe_float(row['Close'])} for dt, row in hist.iterrows()]
+        current_price = chart_data[-1]["price"] if chart_data else 0
+
+        info = {}
+        try: 
+            info = t.info
+            if not info or len(info) < 5: raise Exception("Info Vazio")
+        except: 
+            try:
+                fi = t.fast_info
+                info = {
+                    "shortName": clean_ticker,
+                    "previousClose": safe_float(fi.get("previous_close", 0)),
+                    "fiftyTwoWeekHigh": safe_float(fi.get("year_high", 0)),
+                    "fiftyTwoWeekLow": safe_float(fi.get("year_low", 0)),
+                    "regularMarketPrice": safe_float(fi.get("last_price", 0))
+                }
+            except: pass
+
+        if current_price == 0: current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
+
+        # USA O MOTOR HÍBRIDO!
+        full_history_list = fetch_dividends_hybrid(ticker_upper)
+
+        div_chart_map = {}
+        start_date = datetime.now() - timedelta(days=365)
+        for d in full_history_list:
+            # O motor híbrido devolve pay_date. É o que usamos no gráfico.
+            d_obj = datetime.strptime(d['pay_date'], "%Y-%m-%d")
+            if start_date <= d_obj <= datetime.now():
+                y, m, _ = d['pay_date'].split('-'); ym = f"{m}/{y[2:]}"
+                div_chart_map[ym] = div_chart_map.get(ym, 0) + d['value']
+            
+        div_chart = [{"mes": k, "valor": safe_float(v)} for k, v in list(div_chart_map.items())[::-1]]
+
+        dy = safe_float(info.get("dividendYield", info.get("trailingAnnualDividendYield", 0))) * 100
+        if dy == 0 and current_price > 0 and full_history_list:
+            soma_12m = sum(d['value'] for d in full_history_list if datetime.strptime(d['pay_date'], "%Y-%m-%d") >= start_date and d['status'] == 'RECEBIDO')
+            dy = (soma_12m / current_price) * 100
+
+        pvp = safe_float(info.get("priceToBook", 0))
+        pl = safe_float(info.get("trailingPE", 0))
+        vpa = safe_float(info.get("bookValue", 0))
+        lpa = safe_float(info.get("trailingEps", 0))
+
+        if pvp == 0 and vpa > 0 and current_price > 0: pvp = current_price / vpa
+        if pl == 0 and lpa > 0 and current_price > 0: pl = current_price / lpa
+
+        # Adapta o full_history_list para o frontend (que espera 'date')
+        div_frontend = []
+        for d in full_history_list:
+            div_frontend.append({
+                "date": d["pay_date"], # Mostra a data de pagamento
+                "value": d["value"],
+                "status": d["status"]
+            })
+
+        return {
+            "ticker": clean_ticker,
+            "name": info.get("shortName", info.get("longName", clean_ticker)),
+            "sector": info.get("sector", info.get("industry", "N/A")),
+            "price": current_price,
+            "indicators": {
+                "dy": dy,
+                "pl": pl,
+                "pvp": pvp,
+                "lpa": lpa,
+                "vpa": vpa,
+                "high52w": safe_float(info.get("fiftyTwoWeekHigh", 0)),
+            },
+            "chart": chart_data,
+            "dividends_chart": div_chart, 
+            "full_dividend_history": div_frontend
+        }
+    except Exception as e: raise HTTPException(status_code=404, detail=str(e))
+
+# === EARNINGS COM O MOTOR HÍBRIDO ===
+@app.get("/earnings")
+def get_earnings(wallet_id: int, db: Session = Depends(get_db)):
+    default_res = {"total_acumulado": 0, "historico_mensal": [], "por_ativo": [], "por_classe": [], "detalhes": [], "provisionados": []}
+    trans = db.query(TransactionDB).filter(TransactionDB.wallet_id == wallet_id).all()
+    if not trans: return default_res
+
+    try:
+        holdings = {}
+        for t in trans:
+            if t.ticker not in holdings: holdings[t.ticker] = []
+            holdings[t.ticker].append(t)
+
+        # Busca dividendos hibridos de forma otimizada
+        div_data = {}
+        for t in list(holdings.keys()):
+            h_divs = fetch_dividends_hybrid(t)
+            if h_divs: div_data[t] = h_divs
+
+        total_recebido = 0
+        monthly = {}
+        by_ticker = {}
+        by_class = {}
+        detalhes = []
+        provisionados = []
+        hoje = date.today()
+
+        for ticker, t_list in holdings.items():
+            if ticker not in div_data: continue
+            
+            asset_type = t_list[0].type
+            tick_val = 0
+            
+            for item in div_data[ticker]:
+                ex_date_obj = datetime.strptime(item["ex_date"], "%Y-%m-%d").date()
+                pay_date_obj = datetime.strptime(item["pay_date"], "%Y-%m-%d").date()
+                
+                # O usuário precisa ter comprado a ação ANTES da data Ex!
+                qty = sum(t.quantity for t in t_list if t.date < ex_date_obj)
+                
+                if qty > 0:
+                    payment = qty * item["value"]
+                    obj = {
+                        "date": item["pay_date"], # O display pro usuário é a data que pinga na conta
+                        "ticker": ticker.replace('.SA', ''), 
+                        "type": asset_type, 
+                        "val": safe_float(payment), 
+                        "qtd": safe_float(qty), 
+                        "unit_val": safe_float(item["value"])
+                    }
+                    
+                    if item["status"] == "A RECEBER" or pay_date_obj > hoje:
+                        provisionados.append(obj)
+                    else:
+                        tick_val += payment
+                        total_recebido += payment
+                        detalhes.append(obj)
+                        m = pay_date_obj.strftime("%Y-%m")
+                        if m not in monthly: monthly[m] = {"total":0}
+                        monthly[m]["total"] += payment
+                        if asset_type not in monthly[m]: monthly[m][asset_type] = 0
+                        monthly[m][asset_type] += payment
+            
+            if tick_val > 0:
+                by_ticker[ticker] = tick_val
+                by_class[asset_type] = by_class.get(asset_type, 0) + tick_val
+
+        detalhes.sort(key=lambda x: x['date'], reverse=True)
+        provisionados.sort(key=lambda x: x['date'])
+        hist = [{"mes": date(int(y), int(mo), 1).strftime("%b/%y"), "total": safe_float(monthly[m]["total"]), **{k: safe_float(v) for k, v in monthly[m].items() if k != "total"}} for m in sorted(monthly.keys()) for y, mo in [m.split('-')]]
+        t_list = sorted([{"name": k.replace('.SA',''), "value": safe_float(v)} for k,v in by_ticker.items()], key=lambda x:x["value"], reverse=True)
+        c_list = sorted([{"name": k, "value": safe_float(v)} for k,v in by_class.items()], key=lambda x:x["value"], reverse=True)
+        return {"total_acumulado": safe_float(total_recebido), "historico_mensal": hist, "por_ativo": t_list, "por_classe": c_list, "detalhes": detalhes, "provisionados": provisionados}
+    except Exception as e: 
+        print(f"Erro no Earnings: {e}")
+        return default_res
+
+# === DASHBOARD MANTIDO IGUAL ===
 @app.get("/dashboard")
 def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
     default_res = {"patrimonio_atual":0,"total_investido":0,"lucro":0,"rentabilidade_pct":0,"daily_variation":0,"grafico":[],"ativos":[]}
@@ -295,73 +523,6 @@ def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
     except Exception as e:
         print("Erro Dashboard:", e)
         return default_res
-
-
-# === OUTRAS ROTAS PADRÃO (NÃO MUDARAM) ===
-@app.get("/asset-details/{ticker}")
-def get_asset_details(ticker: str):
-    ticker_upper = ticker.upper().strip()
-    clean_ticker = ticker_upper.replace('.SA', '')
-    if not ticker_upper.endswith('.SA') and not '-' in ticker_upper:
-        if any(char.isdigit() for char in ticker_upper): ticker_upper += '.SA'
-
-    try:
-        t = yf.Ticker(ticker_upper)
-        hist = t.history(period="1y")
-        if hist.empty: raise HTTPException(status_code=404, detail="Ativo não encontrado ou sem dados na B3.")
-
-        chart_data = [{"date": dt.strftime("%d/%m/%y"), "price": safe_float(row['Close'])} for dt, row in hist.iterrows()]
-        current_price = chart_data[-1]["price"] if chart_data else 0
-
-        info = {}
-        try: info = t.info
-        except: pass
-
-        if current_price == 0: current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
-
-        divs = t.dividends
-        full_history_list = []
-        if not divs.empty:
-            if divs.index.tz is not None: divs.index = divs.index.tz_localize(None)
-            hoje = datetime.now()
-            for d, val in divs.items():
-                full_history_list.append({"date": d.strftime("%Y-%m-%d"), "value": safe_float(val), "status": "A RECEBER" if d > hoje else "RECEBIDO"})
-                
-        full_history_list.sort(key=lambda x: x['date'], reverse=True)
-
-        div_chart_map = {}
-        start_date = datetime.now() - timedelta(days=365)
-        for d in full_history_list:
-            d_obj = datetime.strptime(d['date'], "%Y-%m-%d")
-            if start_date <= d_obj <= datetime.now():
-                y, m, _ = d['date'].split('-'); ym = f"{m}/{y[2:]}"
-                div_chart_map[ym] = div_chart_map.get(ym, 0) + d['value']
-            
-        div_chart = [{"mes": k, "valor": safe_float(v)} for k, v in list(div_chart_map.items())[::-1]]
-
-        dy = safe_float(info.get("dividendYield", 0)) * 100 if info.get("dividendYield") else 0
-        if dy == 0 and current_price > 0 and full_history_list:
-            soma_12m = sum(d['value'] for d in full_history_list if datetime.strptime(d['date'], "%Y-%m-%d") >= start_date and d['status'] == 'RECEBIDO')
-            dy = (soma_12m / current_price) * 100
-
-        return {
-            "ticker": clean_ticker,
-            "name": info.get("shortName", info.get("longName", clean_ticker)),
-            "sector": info.get("sector", info.get("industry", "N/A")),
-            "price": current_price,
-            "indicators": {
-                "dy": dy,
-                "pl": safe_float(info.get("trailingPE", 0)),
-                "pvp": safe_float(info.get("priceToBook", 0)),
-                "lpa": safe_float(info.get("trailingEps", 0)),
-                "vpa": safe_float(info.get("bookValue", 0)),
-                "high52w": safe_float(info.get("fiftyTwoWeekHigh", 0)),
-            },
-            "chart": chart_data,
-            "dividends_chart": div_chart, 
-            "full_dividend_history": full_history_list
-        }
-    except Exception as e: raise HTTPException(status_code=404, detail=str(e))
 
 @app.get("/analyze/{ticker}")
 def analyze(ticker: str):
@@ -501,74 +662,6 @@ def price_check(ticker: str, date: str):
         _, p, _ = get_fast_price_var(t)
         return {"price": round(p, 2)}
     except: return {"price": 0.0}
-
-@app.get("/earnings")
-def get_earnings(wallet_id: int, db: Session = Depends(get_db)):
-    default_res = {"total_acumulado": 0, "historico_mensal": [], "por_ativo": [], "por_classe": [], "detalhes": [], "provisionados": []}
-    trans = db.query(TransactionDB).filter(TransactionDB.wallet_id == wallet_id).all()
-    if not trans: return default_res
-
-    try:
-        holdings = {}
-        for t in trans:
-            if t.ticker not in holdings: holdings[t.ticker] = []
-            holdings[t.ticker].append(t)
-
-        div_data = {}
-        for t in list(holdings.keys()):
-            try:
-                tick_data = yf.Ticker(t).dividends
-                if tick_data is not None and not tick_data.empty: div_data[t] = tick_data
-            except: pass
-
-        total_recebido = 0
-        monthly = {}
-        by_ticker = {}
-        by_class = {}
-        detalhes = []
-        provisionados = []
-        hoje = date.today()
-
-        for ticker, t_list in holdings.items():
-            if ticker not in div_data: continue
-            divs = div_data[ticker]
-            if divs.index.tz is not None: divs.index = divs.index.tz_localize(None)
-            
-            first_buy_date = min(t.date for t in t_list)
-            first_buy_ts = pd.Timestamp(first_buy_date)
-            try: divs = divs[divs.index >= first_buy_ts]
-            except: pass
-
-            asset_type = t_list[0].type
-            tick_val = 0
-            
-            for dt, val in divs.items():
-                qty = sum(t.quantity for t in t_list if t.date < dt.date())
-                if qty > 0:
-                    payment = qty * val
-                    obj = {"date": dt.strftime("%Y-%m-%d"), "ticker": ticker.replace('.SA', ''), "type": asset_type, "val": safe_float(payment), "qtd": safe_float(qty), "unit_val": safe_float(val)}
-                    if dt.date() > hoje: provisionados.append(obj)
-                    else:
-                        tick_val += payment
-                        total_recebido += payment
-                        detalhes.append(obj)
-                        m = dt.strftime("%Y-%m")
-                        if m not in monthly: monthly[m] = {"total":0}
-                        monthly[m]["total"] += payment
-                        if asset_type not in monthly[m]: monthly[m][asset_type] = 0
-                        monthly[m][asset_type] += payment
-            
-            if tick_val > 0:
-                by_ticker[ticker] = tick_val
-                by_class[asset_type] = by_class.get(asset_type, 0) + tick_val
-
-        detalhes.sort(key=lambda x: x['date'], reverse=True)
-        provisionados.sort(key=lambda x: x['date'])
-        hist = [{"mes": date(int(y), int(mo), 1).strftime("%b/%y"), "total": safe_float(monthly[m]["total"]), **{k: safe_float(v) for k, v in monthly[m].items() if k != "total"}} for m in sorted(monthly.keys()) for y, mo in [m.split('-')]]
-        t_list = sorted([{"name": k.replace('.SA',''), "value": safe_float(v)} for k,v in by_ticker.items()], key=lambda x:x["value"], reverse=True)
-        c_list = sorted([{"name": k, "value": safe_float(v)} for k,v in by_class.items()], key=lambda x:x["value"], reverse=True)
-        return {"total_acumulado": safe_float(total_recebido), "historico_mensal": hist, "por_ativo": t_list, "por_classe": c_list, "detalhes": detalhes, "provisionados": provisionados}
-    except: return default_res
 
 @app.post("/logos/")
 def upload_logo(logo: LogoCreate, db: Session = Depends(get_db)):
