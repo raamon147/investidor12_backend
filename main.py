@@ -24,7 +24,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./meu_patrimonio_v2.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# CONFIGURAÇÃO ANTI-QUEDA (Resolve o erro SSL do Neon)
 engine_kwargs = {}
 if "postgresql" in DATABASE_URL:
     engine_kwargs["pool_pre_ping"] = True
@@ -127,7 +126,6 @@ def get_realtime_price_sync(ticker):
         return ticker, 0.0
     except: return ticker, 0.0
 
-# FUNÇÃO QUE ESTAVA FALTANDO E QUEBROU O DASHBOARD
 def fetch_prices_sync(tickers):
     res = {}
     for t in tickers:
@@ -147,8 +145,10 @@ def get_watchlists(user_id: int, db: Session = Depends(get_db)):
     watchlists = db.query(WatchlistDB).filter(WatchlistDB.user_id == user_id).all()
     result = []
     all_tickers = set()
+    
     for w in watchlists:
         for item in w.items: all_tickers.add(item.ticker)
+            
     prices = {}
     if all_tickers:
         try:
@@ -165,6 +165,7 @@ def get_watchlists(user_id: int, db: Session = Depends(get_db)):
                             prices[t] = {"price": curr, "variation": var}
                     except: pass
         except: pass
+
     for w in watchlists:
         w_items = []
         for item in w.items:
@@ -176,8 +177,7 @@ def get_watchlists(user_id: int, db: Session = Depends(get_db)):
 
 @app.post("/watchlists/")
 def create_watchlist(wl: WatchlistCreate, db: Session = Depends(get_db)):
-    db_wl = WatchlistDB(user_id=wl.user_id, name=wl.name)
-    db.add(db_wl)
+    db.add(WatchlistDB(user_id=wl.user_id, name=wl.name))
     db.commit()
     return {"message": "Lista criada"}
 
@@ -192,8 +192,7 @@ def add_watchlist_item(id: int, item: WatchlistItemCreate, db: Session = Depends
     clean_ticker = item.ticker.upper().strip()
     existing = db.query(WatchlistItemDB).filter(WatchlistItemDB.watchlist_id == id, WatchlistItemDB.ticker == clean_ticker).first()
     if not existing:
-        db_item = WatchlistItemDB(watchlist_id=id, ticker=clean_ticker)
-        db.add(db_item)
+        db.add(WatchlistItemDB(watchlist_id=id, ticker=clean_ticker))
         db.commit()
     return {"message": "Ativo adicionado"}
 
@@ -208,9 +207,7 @@ def upload_logo(logo: LogoCreate, db: Session = Depends(get_db)):
     ticker_clean = logo.ticker.upper().strip().replace('.SA', '')
     db_logo = db.query(LogoDB).filter(LogoDB.ticker == ticker_clean).first()
     if db_logo: db_logo.image_base64 = logo.image_base64
-    else:
-        db_logo = LogoDB(ticker=ticker_clean, image_base64=logo.image_base64)
-        db.add(db_logo)
+    else: db.add(LogoDB(ticker=ticker_clean, image_base64=logo.image_base64))
     db.commit()
     return {"message": "Logo salva"}
 
@@ -354,8 +351,7 @@ def get_earnings(wallet_id: int, db: Session = Depends(get_db)):
         for t in list(holdings.keys()):
             try:
                 tick_data = yf.Ticker(t).dividends
-                if tick_data is not None and not tick_data.empty:
-                    div_data[t] = tick_data
+                if tick_data is not None and not tick_data.empty: div_data[t] = tick_data
             except: pass
 
         total_recebido = 0
@@ -449,8 +445,7 @@ def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
                     try:
                         s = dados_historicos[tick] if len(tickers) > 1 else dados_historicos
                         s = s.dropna()
-                        if len(s) >= 2:
-                            var_pct = ((safe_float(s.iloc[-1]) - safe_float(s.iloc[-2])) / safe_float(s.iloc[-2])) * 100
+                        if len(s) >= 2: var_pct = ((safe_float(s.iloc[-1]) - safe_float(s.iloc[-2])) / safe_float(s.iloc[-2])) * 100
                     except: pass
                 
                 money_var = tot - (tot / (1 + var_pct/100))
@@ -521,62 +516,102 @@ def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
         return {"patrimonio_atual": safe_float(round(patrimonio_total, 2)), "total_investido": safe_float(round(investido_total, 2)), "lucro": safe_float(round(lucro, 2)), "rentabilidade_pct": safe_float(round(rent_total, 2)), "daily_variation": safe_float(round(daily_pct, 2)), "grafico": chart_data, "ativos": ativos_finais}
     except: return default_res
 
+# --- PANORAMA DE MERCADO DINÂMICO (ROBÔ DE ALTAS E BAIXAS) ---
 @app.get("/market-overview")
 def market_overview():
-    baskets = {
-        "Ações (B3)": ['PETR4.SA', 'VALE3.SA', 'ITUB4.SA', 'BBDC4.SA', 'BBAS3.SA', 'WEGE3.SA', 'ELET3.SA', 'RENT3.SA'],
-        "FIIs (B3)": ['MXRF11.SA', 'HGLG11.SA', 'KNRI11.SA', 'CPTS11.SA', 'BTLG11.SA', 'VGHF11.SA', 'XPML11.SA'],
-        "Stocks (EUA)": ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META'],
-        "Criptomoedas": ['BTC-USD', 'ETH-USD', 'SOL-USD', 'BNB-USD']
-    }
-    all_tickers = []
-    for t_list in baskets.values(): all_tickers.extend(t_list)
+    # Cesta enorme de ativos líquidos para o robô vasculhar
+    br_tickers = ['PETR4.SA', 'VALE3.SA', 'ITUB4.SA', 'BBDC4.SA', 'BBAS3.SA', 'WEGE3.SA', 'ELET3.SA', 'RENT3.SA', 'B3SA3.SA', 'ABEV3.SA', 'MGLU3.SA', 'JBSS3.SA', 'SUZB3.SA', 'GGBR4.SA', 'RADL3.SA', 'CSNA3.SA', 'VIVT3.SA', 'PRIO3.SA', 'EQTL3.SA', 'MXRF11.SA', 'HGLG11.SA', 'KNRI11.SA', 'CPTS11.SA', 'BTLG11.SA', 'VGHF11.SA', 'XPML11.SA']
+    us_tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'AMD']
+    crypto_tickers = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'BNB-USD', 'XRP-USD']
+
+    all_tickers = br_tickers + us_tickers + crypto_tickers
 
     try:
         df = yf.download(all_tickers, period="5d", progress=False, threads=False)
         if 'Close' in df: close_df = df['Close']
         else: close_df = df
 
-        results = {}
-        for category, tickers in baskets.items():
-            cat_data = []
-            prefix = "US$ " if "EUA" in category or "Cripto" in category else "R$ "
-            for t in tickers:
-                try:
-                    if t in close_df.columns:
-                        s = close_df[t].dropna()
-                        if len(s) >= 2:
-                            current = safe_float(s.iloc[-1])
-                            prev = safe_float(s.iloc[-2])
-                            if prev > 0:
-                                var_pct = ((current - prev) / prev) * 100
-                                cat_data.append({"ticker": t.replace('.SA', ''), "price": current, "variation": var_pct, "currency": prefix})
-                except: pass
-            cat_data.sort(key=lambda x: x['variation'], reverse=True)
-            results[category] = cat_data[:5]
-        return results
-    except: return {k: [] for k in baskets.keys()}
+        br_data, us_data, crypto_data = [], [], []
 
+        for t in all_tickers:
+            try:
+                if t in close_df.columns:
+                    s = close_df[t].dropna()
+                    if len(s) >= 2:
+                        current = safe_float(s.iloc[-1])
+                        prev = safe_float(s.iloc[-2])
+                        if prev > 0:
+                            var_pct = ((current - prev) / prev) * 100
+                            item = {"ticker": t.replace('.SA', ''), "price": current, "variation": var_pct}
+                            
+                            if t in br_tickers:
+                                item["currency"] = "R$ "
+                                br_data.append(item)
+                            elif t in us_tickers:
+                                item["currency"] = "US$ "
+                                us_data.append(item)
+                            else:
+                                item["currency"] = "US$ "
+                                crypto_data.append(item)
+            except: pass
+
+        # Classifica as Ações/FIIs BR em Maiores Altas e Maiores Baixas
+        br_data.sort(key=lambda x: x['variation'], reverse=True)
+        top_gainers = br_data[:5]
+        
+        # Pega as 5 piores do Brasil e inverte para o pior ficar no topo
+        top_losers = br_data[-5:]
+        top_losers.sort(key=lambda x: x['variation'])
+
+        us_data.sort(key=lambda x: x['variation'], reverse=True)
+        crypto_data.sort(key=lambda x: x['variation'], reverse=True)
+
+        return {
+            "Maiores Altas (B3)": top_gainers,
+            "Maiores Baixas (B3)": top_losers,
+            "Ações (EUA)": us_data[:5],
+            "Criptomoedas": crypto_data[:5]
+        }
+    except Exception as e:
+        print("Erro Panorama:", e)
+        return {"Maiores Altas (B3)": [], "Maiores Baixas (B3)": [], "Ações (EUA)": [], "Criptomoedas": []}
+
+
+# --- O SEGREDO DO BUSCADOR QUE NÃO QUEBRA ---
 @app.get("/asset-details/{ticker}")
 def get_asset_details(ticker: str):
     ticker_upper = ticker.upper().strip()
     clean_ticker = ticker_upper.replace('.SA', '')
-    if not ticker_upper.endswith('.SA') and not ticker_upper.isalpha() and '-' not in ticker_upper: ticker_upper += '.SA'
+    
+    # Inteligência do sulfixo .SA: Se tem número, é do Brasil. Se não, é EUA/Cripto.
+    if not ticker_upper.endswith('.SA') and not '-' in ticker_upper:
+        if any(char.isdigit() for char in ticker_upper):
+            ticker_upper += '.SA'
 
     try:
         t = yf.Ticker(ticker_upper)
-        info = t.info
-        if not info or ('regularMarketPrice' not in info and 'currentPrice' not in info and 'previousClose' not in info):
-             raise HTTPException(status_code=404, detail="Ativo não encontrado.")
-
+        
+        # 1. TENTA PEGAR O GRÁFICO PRIMEIRO (Muito mais confiável que o .info)
         hist = t.history(period="1y")
-        chart_data = []
-        current_price = 0
-        if not hist.empty:
-            current_price = safe_float(hist['Close'].iloc[-1])
-            for dt, row in hist.iterrows(): chart_data.append({"date": dt.strftime("%d/%m/%y"), "price": safe_float(row['Close'])})
-        if current_price == 0: current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
+        if hist.empty:
+            raise HTTPException(status_code=404, detail="Ativo não encontrado ou sem dados de preço.")
 
+        chart_data = []
+        current_price = safe_float(hist['Close'].iloc[-1])
+        
+        for dt, row in hist.iterrows(): 
+            chart_data.append({"date": dt.strftime("%d/%m/%y"), "price": safe_float(row['Close'])})
+
+        # 2. SE DER ERRO NO .INFO DA BOLSA, A PÁGINA NÃO QUEBRA MAIS
+        try:
+            info = t.info
+        except:
+            info = {}
+
+        if current_price == 0: 
+            current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
+
+        # 3. DIVIDENDOS
         divs = t.dividends
         full_history_list = []
         if not divs.empty:
@@ -625,17 +660,19 @@ def get_asset_details(ticker: str):
             "dividends_chart": div_chart, 
             "full_dividend_history": full_history_list
         }
-    except: raise HTTPException(status_code=404, detail="Não foi possível buscar os dados.")
+    except Exception as e: 
+        raise HTTPException(status_code=404, detail="Não foi possível buscar os dados.")
 
 @app.get("/analyze/{ticker}")
 def analyze(ticker: str):
-    ticker = ticker.upper().strip()
-    clean = ticker.replace('.SA', '')
-    if not ticker.endswith('.SA'): ticker += '.SA'
+    ticker_upper = ticker.upper().strip()
+    clean = ticker_upper.replace('.SA', '')
+    if not ticker_upper.endswith('.SA') and not '-' in ticker_upper:
+        if any(char.isdigit() for char in ticker_upper): ticker_upper += '.SA'
     
     res = { "ticker": clean, "price": 0, "score": 0, "verdict": "Indisponível", "criteria": { "profit": {"status": "GRAY"}, "governance": {"status": "GRAY"}, "debt": {"status": "GRAY"}, "ipo": {"status": "GRAY"} } }
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(ticker_upper)
         try: i = t.info
         except: return res
         if not i: return res
