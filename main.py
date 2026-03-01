@@ -12,9 +12,14 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Float, Date, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, Session, relationship
 from datetime import date, datetime, timedelta
 from typing import List, Optional
+
+# --- FIX SSL ---
+try:
+    requests.packages.urllib3.disable_warnings()
+except: pass
 
 # --- CONFIGURAÇÃO DO BANCO DE DADOS ---
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./meu_patrimonio_v2.db")
@@ -30,6 +35,7 @@ Base = declarative_base()
 def hash_password(password: str):
     return hashlib.sha256(password.encode() + b"investidor12_salt").hexdigest()
 
+# --- MODELOS ---
 class UserDB(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -53,34 +59,35 @@ class TransactionDB(Base):
     price = Column(Float)
     type = Column(String)
 
-# --- NOVA TABELA: LOGOS PERSONALIZADAS ---
 class LogoDB(Base):
     __tablename__ = "logos"
     ticker = Column(String, primary_key=True, index=True)
-    image_base64 = Column(String) # Guarda a imagem convertida em texto
+    image_base64 = Column(String)
+
+# NOVAS TABELAS: LISTAS DE ACOMPANHAMENTO (WATCHLISTS)
+class WatchlistDB(Base):
+    __tablename__ = "watchlists"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    name = Column(String)
+    items = relationship("WatchlistItemDB", back_populates="watchlist", cascade="all, delete-orphan")
+
+class WatchlistItemDB(Base):
+    __tablename__ = "watchlist_items"
+    id = Column(Integer, primary_key=True, index=True)
+    watchlist_id = Column(Integer, ForeignKey("watchlists.id"), nullable=False)
+    ticker = Column(String)
+    watchlist = relationship("WatchlistDB", back_populates="items")
 
 Base.metadata.create_all(bind=engine)
 
-class UserAuth(BaseModel):
-    username: str
-    password: str
-
-class WalletCreate(BaseModel):
-    user_id: int
-    name: str
-    description: Optional[str] = None
-
-class TransactionCreate(BaseModel):
-    wallet_id: int
-    ticker: str
-    date: date
-    quantity: float
-    price: float
-    type: str
-
-class LogoCreate(BaseModel):
-    ticker: str
-    image_base64: str
+# --- SCHEMAS ---
+class UserAuth(BaseModel): username: str; password: str
+class WalletCreate(BaseModel): user_id: int; name: str; description: Optional[str] = None
+class TransactionCreate(BaseModel): wallet_id: int; ticker: str; date: date; quantity: float; price: float; type: str
+class LogoCreate(BaseModel): ticker: str; image_base64: str
+class WatchlistCreate(BaseModel): user_id: int; name: str
+class WatchlistItemCreate(BaseModel): ticker: str
 
 app = FastAPI(title="Investidor12 API")
 
@@ -119,13 +126,6 @@ def get_realtime_price_sync(ticker):
         return ticker, 0.0
     except: return ticker, 0.0
 
-def fetch_prices_sync(tickers):
-    res = {}
-    for t in tickers:
-        tick, p = get_realtime_price_sync(t)
-        res[tick] = p
-    return res
-
 def get_divs_sync(ticker):
     try: return ticker, yf.Ticker(ticker).dividends
     except: return ticker, None
@@ -133,59 +133,120 @@ def get_divs_sync(ticker):
 @app.get("/")
 def read_root(): return {"status": "API Investidor12 Online"}
 
-# --- ROTAS DE LOGO ---
+# --- ROTAS WATCHLIST (LISTAS PERSONALIZADAS) ---
+@app.get("/watchlists/")
+def get_watchlists(user_id: int, db: Session = Depends(get_db)):
+    watchlists = db.query(WatchlistDB).filter(WatchlistDB.user_id == user_id).all()
+    result = []
+    all_tickers = set()
+    
+    for w in watchlists:
+        for item in w.items:
+            all_tickers.add(item.ticker)
+            
+    # Baixa cotações em lote para ficar ultra rápido
+    prices = {}
+    if all_tickers:
+        try:
+            df = yf.download(list(all_tickers), period="5d", progress=False, threads=False)
+            if 'Close' in df:
+                close_df = df['Close']
+                for t in all_tickers:
+                    try:
+                        s = close_df[t].dropna() if isinstance(close_df, pd.DataFrame) else close_df.dropna()
+                        if len(s) >= 2:
+                            curr = safe_float(s.iloc[-1])
+                            prev = safe_float(s.iloc[-2])
+                            var = ((curr - prev) / prev) * 100 if prev > 0 else 0
+                            prices[t] = {"price": curr, "variation": var}
+                    except: pass
+        except: pass
+
+    for w in watchlists:
+        w_items = []
+        for item in w.items:
+            p_data = prices.get(item.ticker, {"price": 0, "variation": 0})
+            w_items.append({
+                "id": item.id,
+                "ticker": item.ticker,
+                "price": p_data["price"],
+                "variation": p_data["variation"]
+            })
+        w_items.sort(key=lambda x: x["variation"], reverse=True)
+        result.append({"id": w.id, "name": w.name, "items": w_items})
+        
+    return result
+
+@app.post("/watchlists/")
+def create_watchlist(wl: WatchlistCreate, db: Session = Depends(get_db)):
+    db_wl = WatchlistDB(user_id=wl.user_id, name=wl.name)
+    db.add(db_wl)
+    db.commit()
+    return {"message": "Lista criada"}
+
+@app.delete("/watchlists/{id}")
+def delete_watchlist(id: int, db: Session = Depends(get_db)):
+    db.query(WatchlistDB).filter(WatchlistDB.id == id).delete()
+    db.commit()
+    return {"message": "Lista excluída"}
+
+@app.post("/watchlists/{id}/items")
+def add_watchlist_item(id: int, item: WatchlistItemCreate, db: Session = Depends(get_db)):
+    clean_ticker = item.ticker.upper().strip()
+    if not clean_ticker.endswith('.SA') and clean_ticker.isalpha(): clean_ticker += '.SA'
+    
+    existing = db.query(WatchlistItemDB).filter(WatchlistItemDB.watchlist_id == id, WatchlistItemDB.ticker == clean_ticker).first()
+    if not existing:
+        db_item = WatchlistItemDB(watchlist_id=id, ticker=clean_ticker)
+        db.add(db_item)
+        db.commit()
+    return {"message": "Ativo adicionado"}
+
+@app.delete("/watchlists/items/{item_id}")
+def delete_watchlist_item(item_id: int, db: Session = Depends(get_db)):
+    db.query(WatchlistItemDB).filter(WatchlistItemDB.id == item_id).delete()
+    db.commit()
+    return {"message": "Ativo removido"}
+
+# --- OUTRAS ROTAS (Logos, Auth, Wallets, Transactions, Dashboard, Earnings) ---
 @app.post("/logos/")
 def upload_logo(logo: LogoCreate, db: Session = Depends(get_db)):
     ticker_clean = logo.ticker.upper().strip().replace('.SA', '')
     db_logo = db.query(LogoDB).filter(LogoDB.ticker == ticker_clean).first()
-    if db_logo:
-        db_logo.image_base64 = logo.image_base64
+    if db_logo: db_logo.image_base64 = logo.image_base64
     else:
         db_logo = LogoDB(ticker=ticker_clean, image_base64=logo.image_base64)
         db.add(db_logo)
     db.commit()
-    return {"message": "Logo salva com sucesso!"}
+    return {"message": "Logo salva"}
 
 @app.get("/logos/{ticker}")
 def get_logo(ticker: str, db: Session = Depends(get_db)):
     ticker_clean = ticker.upper().strip().replace('.SA', '')
     db_logo = db.query(LogoDB).filter(LogoDB.ticker == ticker_clean).first()
-    
-    if not db_logo or not db_logo.image_base64:
-        raise HTTPException(status_code=404, detail="Logo não encontrada no banco")
-    
+    if not db_logo or not db_logo.image_base64: raise HTTPException(status_code=404)
     try:
-        # Separa o cabeçalho (ex: data:image/png;base64) dos dados reais
         header, encoded = db_logo.image_base64.split(",", 1)
         file_ext = header.split(";")[0].split("/")[1]
         data = base64.b64decode(encoded)
         return Response(content=data, media_type=f"image/{file_ext}")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Erro ao decodificar imagem")
+    except: raise HTTPException(status_code=400)
 
 @app.post("/auth/register")
 def register(user: UserAuth, db: Session = Depends(get_db)):
     existing = db.query(UserDB).filter(UserDB.username == user.username.lower()).first()
     if existing: raise HTTPException(status_code=400, detail="Usuário já existe")
-    
     new_user = UserDB(username=user.username.lower(), password=hash_password(user.password))
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
-    
-    def_wallet = WalletDB(name="Carteira Principal", user_id=new_user.id)
-    db.add(def_wallet)
+    db.add(WalletDB(name="Carteira Principal", user_id=new_user.id))
     db.commit()
-    
     return {"id": new_user.id, "username": new_user.username}
 
 @app.post("/auth/login")
 def login(user: UserAuth, db: Session = Depends(get_db)):
-    db_user = db.query(UserDB).filter(
-        UserDB.username == user.username.lower(), 
-        UserDB.password == hash_password(user.password)
-    ).first()
-    
+    db_user = db.query(UserDB).filter(UserDB.username == user.username.lower(), UserDB.password == hash_password(user.password)).first()
     if not db_user: raise HTTPException(status_code=400, detail="Credenciais inválidas")
     return {"id": db_user.id, "username": db_user.username}
 
@@ -213,7 +274,7 @@ def delete_wallet(id: int, db: Session = Depends(get_db)):
     db.query(TransactionDB).filter(TransactionDB.wallet_id == id).delete()
     db.query(WalletDB).filter(WalletDB.id == id).delete()
     db.commit()
-    return {"message": "Carteira e ativos excluídos com sucesso"}
+    return {"message": "OK"}
 
 @app.post("/transactions/")
 def create_transaction(trans: TransactionCreate, db: Session = Depends(get_db)):
@@ -223,8 +284,7 @@ def create_transaction(trans: TransactionCreate, db: Session = Depends(get_db)):
 
 @app.post("/transactions/bulk")
 def create_bulk(transactions: List[TransactionCreate], db: Session = Depends(get_db)):
-    for t in transactions:
-        db.add(TransactionDB(wallet_id=t.wallet_id, ticker=t.ticker.upper(), date=t.date, quantity=t.quantity, price=t.price, type=t.type))
+    for t in transactions: db.add(TransactionDB(wallet_id=t.wallet_id, ticker=t.ticker.upper(), date=t.date, quantity=t.quantity, price=t.price, type=t.type))
     db.commit()
     return {"message": "OK"}
 
@@ -232,7 +292,7 @@ def create_bulk(transactions: List[TransactionCreate], db: Session = Depends(get
 def clear_all(wallet_id: int, db: Session = Depends(get_db)):
     db.query(TransactionDB).filter(TransactionDB.wallet_id == wallet_id).delete()
     db.commit()
-    return {"message": "Limpo"}
+    return {"message": "OK"}
 
 @app.get("/transactions/")
 def list_transactions(wallet_id: int, db: Session = Depends(get_db)):
@@ -249,12 +309,7 @@ def delete_trans(id: int, db: Session = Depends(get_db)):
 def update_trans(id: int, trans: TransactionCreate, db: Session = Depends(get_db)):
     t = db.query(TransactionDB).filter(TransactionDB.id == id).first()
     if t:
-        t.wallet_id = trans.wallet_id
-        t.ticker = trans.ticker.upper()
-        t.date = trans.date
-        t.quantity = trans.quantity
-        t.price = trans.price
-        t.type = trans.type
+        t.wallet_id = trans.wallet_id; t.ticker = trans.ticker.upper(); t.date = trans.date; t.quantity = trans.quantity; t.price = trans.price; t.type = trans.type
         db.commit()
     return {"message": "OK"}
 
@@ -285,7 +340,7 @@ def price_check(ticker: str, date: str):
                 
         _, p = get_realtime_price_sync(ticker_upper)
         return {"price": round(p, 2)}
-    except Exception as e:
+    except:
         _, p = get_realtime_price_sync(ticker_upper)
         return {"price": round(p, 2)}
 
@@ -369,7 +424,6 @@ def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
 
     patrimonio_total = investido_total = daily_var_money = patrimonio_ontem = 0
     ativos_finais = []
-    
     trans_map = {}
     for t in trans:
         if t.ticker not in trans_map: trans_map[t.ticker] = {"qtd":0, "custo":0, "type":t.type}
@@ -443,15 +497,12 @@ def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
                     row = hist_slice.loc[ts]
                     if isinstance(hist_slice, pd.DataFrame):
                         for t, q in posicao.items():
-                            if q > 0 and t in row:
-                                p = safe_float(row[t])
-                                if p > 0: val_mercado += q * p
+                            if q > 0 and t in row: p = safe_float(row[t]); val_mercado += q * p if p > 0 else 0
                     elif isinstance(hist_slice, pd.Series):
                         p = safe_float(row)
                         for t, q in posicao.items():
                             if q > 0 and p > 0: val_mercado += q * p
-                except Exception as e:
-                    pass
+                except: pass
                 
                 if val_mercado == 0: val_mercado = custo
                 rent_cart = ((val_mercado - custo) / custo * 100)
@@ -467,63 +518,15 @@ def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
 
     return {"patrimonio_atual": safe_float(round(patrimonio_total, 2)), "total_investido": safe_float(round(investido_total, 2)), "lucro": safe_float(round(lucro, 2)), "rentabilidade_pct": safe_float(round(rent_total, 2)), "daily_variation": safe_float(round(daily_pct, 2)), "grafico": chart_data, "ativos": ativos_finais}
 
-@app.get("/market-overview")
-def market_overview():
-    baskets = {
-        "Ações (B3)": ['PETR4.SA', 'VALE3.SA', 'ITUB4.SA', 'BBDC4.SA', 'BBAS3.SA', 'WEGE3.SA', 'ELET3.SA', 'RENT3.SA'],
-        "FIIs (B3)": ['MXRF11.SA', 'HGLG11.SA', 'KNRI11.SA', 'CPTS11.SA', 'BTLG11.SA', 'VGHF11.SA', 'XPML11.SA'],
-        "Stocks (EUA)": ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META'],
-        "Criptomoedas": ['BTC-USD', 'ETH-USD', 'SOL-USD', 'BNB-USD']
-    }
-    all_tickers = []
-    for t_list in baskets.values(): all_tickers.extend(t_list)
-
-    try:
-        df = yf.download(all_tickers, period="5d", progress=False, threads=False)
-        if 'Close' in df: close_df = df['Close']
-        else: close_df = df
-
-        results = {}
-        for category, tickers in baskets.items():
-            cat_data = []
-            prefix = "US$ " if "EUA" in category or "Cripto" in category else "R$ "
-            
-            for t in tickers:
-                try:
-                    if t in close_df.columns:
-                        s = close_df[t].dropna()
-                        if len(s) >= 2:
-                            current = safe_float(s.iloc[-1])
-                            prev = safe_float(s.iloc[-2])
-                            if prev > 0:
-                                var_pct = ((current - prev) / prev) * 100
-                                cat_data.append({
-                                    "ticker": t.replace('.SA', ''),
-                                    "price": current,
-                                    "variation": var_pct,
-                                    "currency": prefix
-                                })
-                except: pass
-            
-            cat_data.sort(key=lambda x: x['variation'], reverse=True)
-            results[category] = cat_data[:5]
-        return results
-    except Exception as e:
-        print("Erro Panorama:", e)
-        return {k: [] for k in baskets.keys()}
-
 @app.get("/asset-details/{ticker}")
 def get_asset_details(ticker: str):
     ticker_upper = ticker.upper().strip()
     clean_ticker = ticker_upper.replace('.SA', '')
-    
-    if not ticker_upper.endswith('.SA') and not ticker_upper.isalpha() and '-' not in ticker_upper:
-        ticker_upper += '.SA'
+    if not ticker_upper.endswith('.SA') and not ticker_upper.isalpha() and '-' not in ticker_upper: ticker_upper += '.SA'
 
     try:
         t = yf.Ticker(ticker_upper)
         info = t.info
-        
         if not info or ('regularMarketPrice' not in info and 'currentPrice' not in info and 'previousClose' not in info):
              raise HTTPException(status_code=404, detail="Ativo não encontrado.")
 
@@ -532,43 +535,46 @@ def get_asset_details(ticker: str):
         current_price = 0
         if not hist.empty:
             current_price = safe_float(hist['Close'].iloc[-1])
-            for dt, row in hist.iterrows():
-                chart_data.append({"date": dt.strftime("%d/%m/%y"), "price": safe_float(row['Close'])})
-        
-        if current_price == 0:
-            current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
+            for dt, row in hist.iterrows(): chart_data.append({"date": dt.strftime("%d/%m/%y"), "price": safe_float(row['Close'])})
+        if current_price == 0: current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
 
         divs = t.dividends
-        div_history = []
-        upcoming_divs = []
+        full_history_list = []
         
         if not divs.empty:
             if divs.index.tz is not None: divs.index = divs.index.tz_localize(None)
             hoje = datetime.now()
-            start_date = hoje - timedelta(days=365 * 2) 
             
+            # Gera a lista completa de dividendos com status dinâmico
             for d, val in divs.items():
-                if d >= start_date:
-                    obj = {"date": d.strftime("%Y-%m-%d"), "value": safe_float(val)}
-                    if d > hoje: upcoming_divs.append(obj)
-                    else: div_history.append(obj)
+                status = "A RECEBER" if d > hoje else "RECEBIDO"
+                full_history_list.append({
+                    "date": d.strftime("%Y-%m-%d"), 
+                    "value": safe_float(val),
+                    "status": status
+                })
+                
+        # Ordena a lista do mais recente pro mais antigo
+        full_history_list.sort(key=lambda x: x['date'], reverse=True)
 
+        # Prepara dados do gráfico de 12 meses
         div_chart_map = {}
-        for d in div_history:
-            y, m, _ = d['date'].split('-')
-            ym = f"{m}/{y[2:]}"
-            div_chart_map[ym] = div_chart_map.get(ym, 0) + d['value']
+        hoje = datetime.now()
+        start_date = hoje - timedelta(days=365)
+        for d in full_history_list:
+            d_obj = datetime.strptime(d['date'], "%Y-%m-%d")
+            if d_obj >= start_date and d_obj <= hoje:
+                y, m, _ = d['date'].split('-')
+                ym = f"{m}/{y[2:]}"
+                div_chart_map[ym] = div_chart_map.get(ym, 0) + d['value']
             
-        div_chart = [{"mes": k, "valor": safe_float(v)} for k, v in div_chart_map.items()]
+        div_chart = [{"mes": k, "valor": safe_float(v)} for k, v in list(div_chart_map.items())[::-1]]
 
         dy = safe_float(info.get("dividendYield", info.get("trailingAnnualDividendYield", 0)))
-        if dy > 0:
-            dy = dy * 100 if dy < 1 else dy
+        if dy > 0: dy = dy * 100 if dy < 1 else dy
         else:
-            if current_price > 0 and div_history:
-                hoje = datetime.now()
-                um_ano_atras = hoje - timedelta(days=365)
-                soma_12m = sum(d['value'] for d in div_history if datetime.strptime(d['date'], "%Y-%m-%d") >= um_ano_atras)
+            if current_price > 0 and full_history_list:
+                soma_12m = sum(d['value'] for d in full_history_list if datetime.strptime(d['date'], "%Y-%m-%d") >= start_date and d['status'] == 'RECEBIDO')
                 dy = (soma_12m / current_price) * 100
 
         return {
@@ -586,11 +592,10 @@ def get_asset_details(ticker: str):
                 "low52w": safe_float(info.get("fiftyTwoWeekLow", 0)),
             },
             "chart": chart_data,
-            "dividends_chart": div_chart[-12:], 
-            "upcoming_dividends": upcoming_divs
+            "dividends_chart": div_chart, 
+            "full_dividend_history": full_history_list # <--- Nova lista completa
         }
-    except Exception as e:
-        raise HTTPException(status_code=404, detail="Não foi possível buscar os dados deste ativo.")
+    except: raise HTTPException(status_code=404, detail="Não foi possível buscar os dados.")
 
 @app.get("/analyze/{ticker}")
 def analyze(ticker: str):
