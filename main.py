@@ -166,7 +166,6 @@ def list_wallets(user_id: int, db: Session = Depends(get_db)):
         return [def_wallet]
     return wallets
 
-# --- NOVA ROTA: EXCLUIR CARTEIRA ---
 @app.delete("/wallets/{id}")
 def delete_wallet(id: int, db: Session = Depends(get_db)):
     db.query(TransactionDB).filter(TransactionDB.wallet_id == id).delete()
@@ -399,7 +398,6 @@ def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
             if custo > 0:
                 val_mercado = 0
                 try:
-                    # CORREÇÃO DEFINITIVA DO BUG DE RENTABILIDADE
                     row = hist_slice.loc[ts]
                     if isinstance(hist_slice, pd.DataFrame):
                         for t, q in posicao.items():
@@ -426,6 +424,94 @@ def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
                 chart_data.append({"name": ts.strftime("%d/%m/%y"), "carteira": safe_float(rent_cart), "ibov": safe_float(rent_ibov), "cdi": safe_float((cdi_acc - 1) * 100), "ipca": safe_float((ipca_acc - 1) * 100)})
 
     return {"patrimonio_atual": safe_float(round(patrimonio_total, 2)), "total_investido": safe_float(round(investido_total, 2)), "lucro": safe_float(round(lucro, 2)), "rentabilidade_pct": safe_float(round(rent_total, 2)), "daily_variation": safe_float(round(daily_pct, 2)), "grafico": chart_data, "ativos": ativos_finais}
+
+# --- NOVA ROTA: EXPLORAR ATIVOS ---
+@app.get("/asset-details/{ticker}")
+def get_asset_details(ticker: str):
+    ticker_upper = ticker.upper().strip()
+    clean_ticker = ticker_upper.replace('.SA', '')
+    
+    # Validação básica para adicionar .SA caso seja ação brasileira
+    if not ticker_upper.endswith('.SA') and not ticker_upper.isalpha():
+        ticker_upper += '.SA'
+
+    try:
+        t = yf.Ticker(ticker_upper)
+        info = t.info
+        
+        if not info or ('regularMarketPrice' not in info and 'currentPrice' not in info and 'previousClose' not in info):
+             raise HTTPException(status_code=404, detail="Ativo não encontrado na base de dados.")
+
+        # 1. Pegar histórico de preços de 1 ano
+        hist = t.history(period="1y")
+        chart_data = []
+        current_price = 0
+        if not hist.empty:
+            current_price = safe_float(hist['Close'].iloc[-1])
+            for dt, row in hist.iterrows():
+                chart_data.append({
+                    "date": dt.strftime("%d/%m/%y"),
+                    "price": safe_float(row['Close'])
+                })
+        
+        if current_price == 0:
+            current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
+
+        # 2. Pegar Dividendos (Histórico e Futuros)
+        divs = t.dividends
+        div_history = []
+        upcoming_divs = []
+        
+        if not divs.empty:
+            if divs.index.tz is not None: 
+                divs.index = divs.index.tz_localize(None)
+            
+            hoje = datetime.now()
+            start_date = hoje - timedelta(days=365 * 2) # Últimos 2 anos para o gráfico
+            
+            for d, val in divs.items():
+                if d >= start_date:
+                    obj = {"date": d.strftime("%Y-%m-%d"), "value": safe_float(val)}
+                    if d > hoje:
+                        upcoming_divs.append(obj)
+                    else:
+                        div_history.append(obj)
+
+        # Agrupar dividendos por Mês/Ano para o gráfico
+        div_chart_map = {}
+        for d in div_history:
+            y, m, _ = d['date'].split('-')
+            ym = f"{m}/{y[2:]}"
+            div_chart_map[ym] = div_chart_map.get(ym, 0) + d['value']
+            
+        div_chart = [{"mes": k, "valor": safe_float(v)} for k, v in div_chart_map.items()]
+
+        # Calcular DY alternativo se a API não entregar
+        dy = safe_float(info.get("dividendYield", info.get("trailingAnnualDividendYield", 0))) * 100
+        if dy == 0 and current_price > 0 and div_chart_map:
+            # Soma dos ultimos 12 meses aproximada
+            dy = (sum(div_chart_map.values()) / current_price) * 100
+
+        return {
+            "ticker": clean_ticker,
+            "name": info.get("shortName", info.get("longName", clean_ticker)),
+            "sector": info.get("sector", info.get("industry", "N/A")),
+            "price": current_price,
+            "indicators": {
+                "dy": dy,
+                "pl": safe_float(info.get("trailingPE", 0)),
+                "pvp": safe_float(info.get("priceToBook", 0)),
+                "lpa": safe_float(info.get("trailingEps", 0)),
+                "vpa": safe_float(info.get("bookValue", 0)),
+                "high52w": safe_float(info.get("fiftyTwoWeekHigh", 0)),
+                "low52w": safe_float(info.get("fiftyTwoWeekLow", 0)),
+            },
+            "chart": chart_data,
+            "dividends_chart": div_chart[-12:], # Mostra apenas os ultimos 12 meses com pagamento
+            "upcoming_dividends": upcoming_divs
+        }
+    except Exception as e:
+        raise HTTPException(status_code=404, detail="Não foi possível buscar os dados deste ativo.")
 
 @app.get("/analyze/{ticker}")
 def analyze(ticker: str):
