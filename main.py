@@ -16,12 +16,10 @@ from sqlalchemy.orm import sessionmaker, Session, relationship
 from datetime import date, datetime, timedelta
 from typing import List, Optional
 
-# --- FIX SSL ---
 try:
     requests.packages.urllib3.disable_warnings()
 except: pass
 
-# --- CONFIGURAÇÃO DO BANCO DE DADOS ---
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./meu_patrimonio_v2.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -31,11 +29,9 @@ engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- SEGURANÇA ---
 def hash_password(password: str):
     return hashlib.sha256(password.encode() + b"investidor12_salt").hexdigest()
 
-# --- MODELOS ---
 class UserDB(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -64,7 +60,6 @@ class LogoDB(Base):
     ticker = Column(String, primary_key=True, index=True)
     image_base64 = Column(String)
 
-# NOVAS TABELAS: LISTAS DE ACOMPANHAMENTO (WATCHLISTS)
 class WatchlistDB(Base):
     __tablename__ = "watchlists"
     id = Column(Integer, primary_key=True, index=True)
@@ -81,7 +76,6 @@ class WatchlistItemDB(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# --- SCHEMAS ---
 class UserAuth(BaseModel): username: str; password: str
 class WalletCreate(BaseModel): user_id: int; name: str; description: Optional[str] = None
 class TransactionCreate(BaseModel): wallet_id: int; ticker: str; date: date; quantity: float; price: float; type: str
@@ -126,14 +120,9 @@ def get_realtime_price_sync(ticker):
         return ticker, 0.0
     except: return ticker, 0.0
 
-def get_divs_sync(ticker):
-    try: return ticker, yf.Ticker(ticker).dividends
-    except: return ticker, None
-
 @app.get("/")
 def read_root(): return {"status": "API Investidor12 Online"}
 
-# --- ROTAS WATCHLIST (LISTAS PERSONALIZADAS) ---
 @app.get("/watchlists/")
 def get_watchlists(user_id: int, db: Session = Depends(get_db)):
     watchlists = db.query(WatchlistDB).filter(WatchlistDB.user_id == user_id).all()
@@ -141,10 +130,8 @@ def get_watchlists(user_id: int, db: Session = Depends(get_db)):
     all_tickers = set()
     
     for w in watchlists:
-        for item in w.items:
-            all_tickers.add(item.ticker)
+        for item in w.items: all_tickers.add(item.ticker)
             
-    # Baixa cotações em lote para ficar ultra rápido
     prices = {}
     if all_tickers:
         try:
@@ -166,12 +153,7 @@ def get_watchlists(user_id: int, db: Session = Depends(get_db)):
         w_items = []
         for item in w.items:
             p_data = prices.get(item.ticker, {"price": 0, "variation": 0})
-            w_items.append({
-                "id": item.id,
-                "ticker": item.ticker,
-                "price": p_data["price"],
-                "variation": p_data["variation"]
-            })
+            w_items.append({"id": item.id, "ticker": item.ticker, "price": p_data["price"], "variation": p_data["variation"]})
         w_items.sort(key=lambda x: x["variation"], reverse=True)
         result.append({"id": w.id, "name": w.name, "items": w_items})
         
@@ -192,9 +174,8 @@ def delete_watchlist(id: int, db: Session = Depends(get_db)):
 
 @app.post("/watchlists/{id}/items")
 def add_watchlist_item(id: int, item: WatchlistItemCreate, db: Session = Depends(get_db)):
+    # CORREÇÃO: Respeita o ticker enviado sem forçar o .SA (Permite adicionar ativos americanos e criptos)
     clean_ticker = item.ticker.upper().strip()
-    if not clean_ticker.endswith('.SA') and clean_ticker.isalpha(): clean_ticker += '.SA'
-    
     existing = db.query(WatchlistItemDB).filter(WatchlistItemDB.watchlist_id == id, WatchlistItemDB.ticker == clean_ticker).first()
     if not existing:
         db_item = WatchlistItemDB(watchlist_id=id, ticker=clean_ticker)
@@ -208,7 +189,6 @@ def delete_watchlist_item(item_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "Ativo removido"}
 
-# --- OUTRAS ROTAS (Logos, Auth, Wallets, Transactions, Dashboard, Earnings) ---
 @app.post("/logos/")
 def upload_logo(logo: LogoCreate, db: Session = Depends(get_db)):
     ticker_clean = logo.ticker.upper().strip().replace('.SA', '')
@@ -346,177 +326,229 @@ def price_check(ticker: str, date: str):
 
 @app.get("/earnings")
 def get_earnings(wallet_id: int, db: Session = Depends(get_db)):
+    # Blinda o backend para não devolver falha caso o Yfinance não ache os dados
+    default_res = {"total_acumulado": 0, "historico_mensal": [], "por_ativo": [], "por_classe": [], "detalhes": [], "provisionados": []}
     trans = db.query(TransactionDB).filter(TransactionDB.wallet_id == wallet_id).all()
-    if not trans: return {"total_acumulado": 0, "historico_mensal": [], "por_ativo": [], "por_classe": [], "detalhes": [], "provisionados": []}
+    if not trans: return default_res
 
-    holdings = {}
-    for t in trans:
-        if t.ticker not in holdings: holdings[t.ticker] = []
-        holdings[t.ticker].append(t)
+    try:
+        holdings = {}
+        for t in trans:
+            if t.ticker not in holdings: holdings[t.ticker] = []
+            holdings[t.ticker].append(t)
 
-    div_data = {}
-    for t in list(holdings.keys()):
-        tick, d = get_divs_sync(t)
-        if d is not None: div_data[tick] = d
+        div_data = {}
+        for t in list(holdings.keys()):
+            try:
+                tick_data = yf.Ticker(t).dividends
+                if tick_data is not None and not tick_data.empty:
+                    div_data[t] = tick_data
+            except: pass
 
-    total_recebido = 0
-    monthly = {}
-    by_ticker = {}
-    by_class = {}
-    detalhes = []
-    provisionados = []
-    hoje = date.today()
+        total_recebido = 0
+        monthly = {}
+        by_ticker = {}
+        by_class = {}
+        detalhes = []
+        provisionados = []
+        hoje = date.today()
 
-    for ticker, t_list in holdings.items():
-        if ticker not in div_data or div_data[ticker].empty: continue
-        divs = div_data[ticker]
-        if divs.index.tz is not None: divs.index = divs.index.tz_localize(None)
-        
-        first_buy_date = min(t.date for t in t_list)
-        first_buy_ts = pd.Timestamp(first_buy_date)
-        try: divs = divs[divs.index >= first_buy_ts]
-        except: pass
+        for ticker, t_list in holdings.items():
+            if ticker not in div_data: continue
+            divs = div_data[ticker]
+            if divs.index.tz is not None: divs.index = divs.index.tz_localize(None)
+            
+            first_buy_date = min(t.date for t in t_list)
+            first_buy_ts = pd.Timestamp(first_buy_date)
+            try: divs = divs[divs.index >= first_buy_ts]
+            except: pass
 
-        asset_type = t_list[0].type
-        tick_val = 0
-        
-        for dt, val in divs.items():
-            qty = sum(t.quantity for t in t_list if t.date < dt.date())
-            if qty > 0:
-                payment = qty * val
-                obj = {"date": dt.strftime("%Y-%m-%d"), "ticker": ticker.replace('.SA', ''), "type": asset_type, "val": safe_float(payment), "qtd": safe_float(qty), "unit_val": safe_float(val)}
-                if dt.date() > hoje: provisionados.append(obj)
-                else:
-                    tick_val += payment
-                    total_recebido += payment
-                    detalhes.append(obj)
-                    m = dt.strftime("%Y-%m")
-                    if m not in monthly: monthly[m] = {"total":0}
-                    monthly[m]["total"] += payment
-                    if asset_type not in monthly[m]: monthly[m][asset_type] = 0
-                    monthly[m][asset_type] += payment
-        
-        if tick_val > 0:
-            by_ticker[ticker] = tick_val
-            by_class[asset_type] = by_class.get(asset_type, 0) + tick_val
+            asset_type = t_list[0].type
+            tick_val = 0
+            
+            for dt, val in divs.items():
+                qty = sum(t.quantity for t in t_list if t.date < dt.date())
+                if qty > 0:
+                    payment = qty * val
+                    obj = {"date": dt.strftime("%Y-%m-%d"), "ticker": ticker.replace('.SA', ''), "type": asset_type, "val": safe_float(payment), "qtd": safe_float(qty), "unit_val": safe_float(val)}
+                    if dt.date() > hoje: provisionados.append(obj)
+                    else:
+                        tick_val += payment
+                        total_recebido += payment
+                        detalhes.append(obj)
+                        m = dt.strftime("%Y-%m")
+                        if m not in monthly: monthly[m] = {"total":0}
+                        monthly[m]["total"] += payment
+                        if asset_type not in monthly[m]: monthly[m][asset_type] = 0
+                        monthly[m][asset_type] += payment
+            
+            if tick_val > 0:
+                by_ticker[ticker] = tick_val
+                by_class[asset_type] = by_class.get(asset_type, 0) + tick_val
 
-    detalhes.sort(key=lambda x: x['date'], reverse=True)
-    provisionados.sort(key=lambda x: x['date'])
-    hist = [{"mes": date(int(y), int(mo), 1).strftime("%b/%y"), "total": safe_float(monthly[m]["total"]), **{k: safe_float(v) for k, v in monthly[m].items() if k != "total"}} for m in sorted(monthly.keys()) for y, mo in [m.split('-')]]
-    t_list = sorted([{"name": k.replace('.SA',''), "value": safe_float(v)} for k,v in by_ticker.items()], key=lambda x:x["value"], reverse=True)
-    c_list = sorted([{"name": k, "value": safe_float(v)} for k,v in by_class.items()], key=lambda x:x["value"], reverse=True)
-    return {"total_acumulado": safe_float(total_recebido), "historico_mensal": hist, "por_ativo": t_list, "por_classe": c_list, "detalhes": detalhes, "provisionados": provisionados}
+        detalhes.sort(key=lambda x: x['date'], reverse=True)
+        provisionados.sort(key=lambda x: x['date'])
+        hist = [{"mes": date(int(y), int(mo), 1).strftime("%b/%y"), "total": safe_float(monthly[m]["total"]), **{k: safe_float(v) for k, v in monthly[m].items() if k != "total"}} for m in sorted(monthly.keys()) for y, mo in [m.split('-')]]
+        t_list = sorted([{"name": k.replace('.SA',''), "value": safe_float(v)} for k,v in by_ticker.items()], key=lambda x:x["value"], reverse=True)
+        c_list = sorted([{"name": k, "value": safe_float(v)} for k,v in by_class.items()], key=lambda x:x["value"], reverse=True)
+        return {"total_acumulado": safe_float(total_recebido), "historico_mensal": hist, "por_ativo": t_list, "por_classe": c_list, "detalhes": detalhes, "provisionados": provisionados}
+    except Exception as e:
+        print("Erro Earnings:", e)
+        return default_res
 
 @app.get("/dashboard")
 def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
+    default_res = {"patrimonio_atual":0,"total_investido":0,"lucro":0,"rentabilidade_pct":0,"daily_variation":0,"grafico":[],"ativos":[]}
     trans = db.query(TransactionDB).filter(TransactionDB.wallet_id == wallet_id).all()
-    if not trans: return {"patrimonio_atual":0,"total_investido":0,"lucro":0,"rentabilidade_pct":0,"daily_variation":0,"grafico":[],"ativos":[]}
-
-    tickers = list(set(t.ticker for t in trans))
-    precos_atuais = fetch_prices_sync(tickers)
+    if not trans: return default_res
 
     try:
-        data_inicio_real = min(t.date for t in trans)
-        lista_download = tickers + ['^BVSP']
-        dados_historicos = yf.download(lista_download, start=data_inicio_real, progress=False, auto_adjust=True, threads=False)['Close']
-        if not dados_historicos.empty: dados_historicos = dados_historicos.ffill().bfill()
-    except: dados_historicos = pd.DataFrame()
+        tickers = list(set(t.ticker for t in trans))
+        precos_atuais = fetch_prices_sync(tickers)
 
-    patrimonio_total = investido_total = daily_var_money = patrimonio_ontem = 0
-    ativos_finais = []
-    trans_map = {}
-    for t in trans:
-        if t.ticker not in trans_map: trans_map[t.ticker] = {"qtd":0, "custo":0, "type":t.type}
-        trans_map[t.ticker]["qtd"] += t.quantity
-        trans_map[t.ticker]["custo"] += (t.quantity * t.price)
-
-    is_weekend = date.today().weekday() >= 5
-
-    for tick, d in trans_map.items():
-        if d["qtd"] > 0:
-            pm = d["custo"] / d["qtd"]
-            p_atual = precos_atuais.get(tick, 0.0)
-            if p_atual == 0: p_atual = pm 
-            
-            tot = d["qtd"] * p_atual
-            lucro_ativo = tot - d["custo"]
-            rent = ((p_atual - pm) / pm) * 100 if pm > 0 else 0
-            
-            var_pct = 0.0
-            if not is_weekend and not dados_historicos.empty:
-                try:
-                    s = dados_historicos[tick] if len(tickers) > 1 else dados_historicos
-                    s = s.dropna()
-                    if len(s) >= 2:
-                        var_pct = ((safe_float(s.iloc[-1]) - safe_float(s.iloc[-2])) / safe_float(s.iloc[-2])) * 100
-                except: pass
-            
-            money_var = tot - (tot / (1 + var_pct/100))
-            patrimonio_total += tot
-            investido_total += d["custo"]
-            daily_var_money += money_var
-            patrimonio_ontem += (tot - money_var)
-            
-            ativos_finais.append({"ticker": tick, "type": d["type"], "qtd": safe_float(d["qtd"]), "pm": safe_float(pm), "atual": safe_float(p_atual), "total": safe_float(tot), "rentabilidade": safe_float(rent), "lucro_valor": safe_float(lucro_ativo), "variacao_diaria": safe_float(var_pct), "variacao_diaria_valor": safe_float(money_var)})
-
-    ativos_finais.sort(key=lambda x:x['total'], reverse=True)
-    lucro = patrimonio_total - investido_total
-    rent_total = (lucro / investido_total * 100) if investido_total > 0 else 0
-    daily_pct = (daily_var_money / patrimonio_ontem * 100) if patrimonio_ontem > 0 else 0
-
-    chart_data = []
-    if not dados_historicos.empty:
-        if dados_historicos.index.tz is not None: dados_historicos.index = dados_historicos.index.tz_localize(None)
-        
-        hist_slice = dados_historicos[dados_historicos.index >= pd.Timestamp(data_inicio_real)]
-        cdi_acc, ipca_acc, ibov_start = 1.0, 1.0, 0
         try:
-            if '^BVSP' in hist_slice.columns and not hist_slice['^BVSP'].dropna().empty: ibov_start = safe_float(hist_slice['^BVSP'].dropna().iloc[0])
-            elif isinstance(hist_slice, pd.Series) and hist_slice.name == '^BVSP': ibov_start = safe_float(hist_slice.iloc[0])
-        except: pass
+            data_inicio_real = min(t.date for t in trans)
+            lista_download = tickers + ['^BVSP']
+            dados_historicos = yf.download(lista_download, start=data_inicio_real, progress=False, auto_adjust=True, threads=False)['Close']
+            if not dados_historicos.empty: dados_historicos = dados_historicos.ffill().bfill()
+        except: dados_historicos = pd.DataFrame()
 
-        posicao, custo, trans_date = {t:0 for t in tickers}, 0, {}
-        for tr in trans:
-            ds = tr.date.strftime('%Y-%m-%d')
-            if ds not in trans_date: trans_date[ds] = []
-            trans_date[ds].append(tr)
+        patrimonio_total = investido_total = daily_var_money = patrimonio_ontem = 0
+        ativos_finais = []
+        trans_map = {}
+        for t in trans:
+            if t.ticker not in trans_map: trans_map[t.ticker] = {"qtd":0, "custo":0, "type":t.type}
+            trans_map[t.ticker]["qtd"] += t.quantity
+            trans_map[t.ticker]["custo"] += (t.quantity * t.price)
 
-        for ts in hist_slice.index:
-            ds = ts.strftime('%Y-%m-%d')
-            cdi_acc *= 1.0004
-            ipca_acc *= 1.00017
+        is_weekend = date.today().weekday() >= 5
+
+        for tick, d in trans_map.items():
+            if d["qtd"] > 0:
+                pm = d["custo"] / d["qtd"]
+                p_atual = precos_atuais.get(tick, 0.0)
+                if p_atual == 0: p_atual = pm 
+                
+                tot = d["qtd"] * p_atual
+                lucro_ativo = tot - d["custo"]
+                rent = ((p_atual - pm) / pm) * 100 if pm > 0 else 0
+                
+                var_pct = 0.0
+                if not is_weekend and not dados_historicos.empty:
+                    try:
+                        s = dados_historicos[tick] if len(tickers) > 1 else dados_historicos
+                        s = s.dropna()
+                        if len(s) >= 2:
+                            var_pct = ((safe_float(s.iloc[-1]) - safe_float(s.iloc[-2])) / safe_float(s.iloc[-2])) * 100
+                    except: pass
+                
+                money_var = tot - (tot / (1 + var_pct/100))
+                patrimonio_total += tot
+                investido_total += d["custo"]
+                daily_var_money += money_var
+                patrimonio_ontem += (tot - money_var)
+                
+                ativos_finais.append({"ticker": tick, "type": d["type"], "qtd": safe_float(d["qtd"]), "pm": safe_float(pm), "atual": safe_float(p_atual), "total": safe_float(tot), "rentabilidade": safe_float(rent), "lucro_valor": safe_float(lucro_ativo), "variacao_diaria": safe_float(var_pct), "variacao_diaria_valor": safe_float(money_var)})
+
+        ativos_finais.sort(key=lambda x:x['total'], reverse=True)
+        lucro = patrimonio_total - investido_total
+        rent_total = (lucro / investido_total * 100) if investido_total > 0 else 0
+        daily_pct = (daily_var_money / patrimonio_ontem * 100) if patrimonio_ontem > 0 else 0
+
+        chart_data = []
+        if not dados_historicos.empty:
+            if dados_historicos.index.tz is not None: dados_historicos.index = dados_historicos.index.tz_localize(None)
             
-            if ds in trans_date:
-                for tr in trans_date[ds]:
-                    posicao[tr.ticker] += tr.quantity
-                    custo += (tr.quantity * tr.price)
-            
-            if custo > 0:
-                val_mercado = 0
-                try:
-                    row = hist_slice.loc[ts]
-                    if isinstance(hist_slice, pd.DataFrame):
-                        for t, q in posicao.items():
-                            if q > 0 and t in row: p = safe_float(row[t]); val_mercado += q * p if p > 0 else 0
-                    elif isinstance(hist_slice, pd.Series):
-                        p = safe_float(row)
-                        for t, q in posicao.items():
-                            if q > 0 and p > 0: val_mercado += q * p
-                except: pass
-                
-                if val_mercado == 0: val_mercado = custo
-                rent_cart = ((val_mercado - custo) / custo * 100)
-                
-                rent_ibov = 0
-                try:
-                    if ibov_start > 0:
-                        curr = safe_float(hist_slice.loc[ts]['^BVSP']) if isinstance(hist_slice, pd.DataFrame) and '^BVSP' in hist_slice.columns else (safe_float(hist_slice.loc[ts]) if isinstance(hist_slice, pd.Series) and hist_slice.name == '^BVSP' else 0)
-                        if curr > 0: rent_ibov = ((curr - ibov_start) / ibov_start) * 100
-                except: pass
-                
-                chart_data.append({"name": ts.strftime("%d/%m/%y"), "carteira": safe_float(rent_cart), "ibov": safe_float(rent_ibov), "cdi": safe_float((cdi_acc - 1) * 100), "ipca": safe_float((ipca_acc - 1) * 100)})
+            hist_slice = dados_historicos[dados_historicos.index >= pd.Timestamp(data_inicio_real)]
+            cdi_acc, ipca_acc, ibov_start = 1.0, 1.0, 0
+            try:
+                if '^BVSP' in hist_slice.columns and not hist_slice['^BVSP'].dropna().empty: ibov_start = safe_float(hist_slice['^BVSP'].dropna().iloc[0])
+                elif isinstance(hist_slice, pd.Series) and hist_slice.name == '^BVSP': ibov_start = safe_float(hist_slice.iloc[0])
+            except: pass
 
-    return {"patrimonio_atual": safe_float(round(patrimonio_total, 2)), "total_investido": safe_float(round(investido_total, 2)), "lucro": safe_float(round(lucro, 2)), "rentabilidade_pct": safe_float(round(rent_total, 2)), "daily_variation": safe_float(round(daily_pct, 2)), "grafico": chart_data, "ativos": ativos_finais}
+            posicao, custo, trans_date = {t:0 for t in tickers}, 0, {}
+            for tr in trans:
+                ds = tr.date.strftime('%Y-%m-%d')
+                if ds not in trans_date: trans_date[ds] = []
+                trans_date[ds].append(tr)
+
+            for ts in hist_slice.index:
+                ds = ts.strftime('%Y-%m-%d')
+                cdi_acc *= 1.0004
+                ipca_acc *= 1.00017
+                
+                if ds in trans_date:
+                    for tr in trans_date[ds]:
+                        posicao[tr.ticker] += tr.quantity
+                        custo += (tr.quantity * tr.price)
+                
+                if custo > 0:
+                    val_mercado = 0
+                    try:
+                        row = hist_slice.loc[ts]
+                        if isinstance(hist_slice, pd.DataFrame):
+                            for t, q in posicao.items():
+                                if q > 0 and t in row: p = safe_float(row[t]); val_mercado += q * p if p > 0 else 0
+                        elif isinstance(hist_slice, pd.Series):
+                            p = safe_float(row)
+                            for t, q in posicao.items():
+                                if q > 0 and p > 0: val_mercado += q * p
+                    except: pass
+                    
+                    if val_mercado == 0: val_mercado = custo
+                    rent_cart = ((val_mercado - custo) / custo * 100)
+                    
+                    rent_ibov = 0
+                    try:
+                        if ibov_start > 0:
+                            curr = safe_float(hist_slice.loc[ts]['^BVSP']) if isinstance(hist_slice, pd.DataFrame) and '^BVSP' in hist_slice.columns else (safe_float(hist_slice.loc[ts]) if isinstance(hist_slice, pd.Series) and hist_slice.name == '^BVSP' else 0)
+                            if curr > 0: rent_ibov = ((curr - ibov_start) / ibov_start) * 100
+                    except: pass
+                    
+                    chart_data.append({"name": ts.strftime("%d/%m/%y"), "carteira": safe_float(rent_cart), "ibov": safe_float(rent_ibov), "cdi": safe_float((cdi_acc - 1) * 100), "ipca": safe_float((ipca_acc - 1) * 100)})
+
+        return {"patrimonio_atual": safe_float(round(patrimonio_total, 2)), "total_investido": safe_float(round(investido_total, 2)), "lucro": safe_float(round(lucro, 2)), "rentabilidade_pct": safe_float(round(rent_total, 2)), "daily_variation": safe_float(round(daily_pct, 2)), "grafico": chart_data, "ativos": ativos_finais}
+    except Exception as e:
+        print("Erro Dashboard:", e)
+        return default_res
+
+@app.get("/market-overview")
+def market_overview():
+    baskets = {
+        "Ações (B3)": ['PETR4.SA', 'VALE3.SA', 'ITUB4.SA', 'BBDC4.SA', 'BBAS3.SA', 'WEGE3.SA', 'ELET3.SA', 'RENT3.SA'],
+        "FIIs (B3)": ['MXRF11.SA', 'HGLG11.SA', 'KNRI11.SA', 'CPTS11.SA', 'BTLG11.SA', 'VGHF11.SA', 'XPML11.SA'],
+        "Stocks (EUA)": ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META'],
+        "Criptomoedas": ['BTC-USD', 'ETH-USD', 'SOL-USD', 'BNB-USD']
+    }
+    all_tickers = []
+    for t_list in baskets.values(): all_tickers.extend(t_list)
+
+    try:
+        df = yf.download(all_tickers, period="5d", progress=False, threads=False)
+        if 'Close' in df: close_df = df['Close']
+        else: close_df = df
+
+        results = {}
+        for category, tickers in baskets.items():
+            cat_data = []
+            prefix = "US$ " if "EUA" in category or "Cripto" in category else "R$ "
+            
+            for t in tickers:
+                try:
+                    if t in close_df.columns:
+                        s = close_df[t].dropna()
+                        if len(s) >= 2:
+                            current = safe_float(s.iloc[-1])
+                            prev = safe_float(s.iloc[-2])
+                            if prev > 0:
+                                var_pct = ((current - prev) / prev) * 100
+                                cat_data.append({"ticker": t.replace('.SA', ''), "price": current, "variation": var_pct, "currency": prefix})
+                except: pass
+            cat_data.sort(key=lambda x: x['variation'], reverse=True)
+            results[category] = cat_data[:5]
+        return results
+    except Exception as e:
+        return {k: [] for k in baskets.keys()}
 
 @app.get("/asset-details/{ticker}")
 def get_asset_details(ticker: str):
@@ -540,24 +572,15 @@ def get_asset_details(ticker: str):
 
         divs = t.dividends
         full_history_list = []
-        
         if not divs.empty:
             if divs.index.tz is not None: divs.index = divs.index.tz_localize(None)
             hoje = datetime.now()
-            
-            # Gera a lista completa de dividendos com status dinâmico
             for d, val in divs.items():
                 status = "A RECEBER" if d > hoje else "RECEBIDO"
-                full_history_list.append({
-                    "date": d.strftime("%Y-%m-%d"), 
-                    "value": safe_float(val),
-                    "status": status
-                })
+                full_history_list.append({"date": d.strftime("%Y-%m-%d"), "value": safe_float(val), "status": status})
                 
-        # Ordena a lista do mais recente pro mais antigo
         full_history_list.sort(key=lambda x: x['date'], reverse=True)
 
-        # Prepara dados do gráfico de 12 meses
         div_chart_map = {}
         hoje = datetime.now()
         start_date = hoje - timedelta(days=365)
@@ -593,7 +616,7 @@ def get_asset_details(ticker: str):
             },
             "chart": chart_data,
             "dividends_chart": div_chart, 
-            "full_dividend_history": full_history_list # <--- Nova lista completa
+            "full_dividend_history": full_history_list
         }
     except: raise HTTPException(status_code=404, detail="Não foi possível buscar os dados.")
 
