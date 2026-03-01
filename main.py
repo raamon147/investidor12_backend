@@ -24,8 +24,15 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./meu_patrimonio_v2.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-connect_args = {"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+# CONFIGURAÇÃO ANTI-QUEDA (Resolve o erro SSL do Neon)
+engine_kwargs = {}
+if "postgresql" in DATABASE_URL:
+    engine_kwargs["pool_pre_ping"] = True
+    engine_kwargs["pool_recycle"] = 300
+else:
+    engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -120,6 +127,18 @@ def get_realtime_price_sync(ticker):
         return ticker, 0.0
     except: return ticker, 0.0
 
+# FUNÇÃO QUE ESTAVA FALTANDO E QUEBROU O DASHBOARD
+def fetch_prices_sync(tickers):
+    res = {}
+    for t in tickers:
+        tick, p = get_realtime_price_sync(t)
+        res[tick] = p
+    return res
+
+def get_divs_sync(ticker):
+    try: return ticker, yf.Ticker(ticker).dividends
+    except: return ticker, None
+
 @app.get("/")
 def read_root(): return {"status": "API Investidor12 Online"}
 
@@ -128,10 +147,8 @@ def get_watchlists(user_id: int, db: Session = Depends(get_db)):
     watchlists = db.query(WatchlistDB).filter(WatchlistDB.user_id == user_id).all()
     result = []
     all_tickers = set()
-    
     for w in watchlists:
         for item in w.items: all_tickers.add(item.ticker)
-            
     prices = {}
     if all_tickers:
         try:
@@ -148,7 +165,6 @@ def get_watchlists(user_id: int, db: Session = Depends(get_db)):
                             prices[t] = {"price": curr, "variation": var}
                     except: pass
         except: pass
-
     for w in watchlists:
         w_items = []
         for item in w.items:
@@ -156,7 +172,6 @@ def get_watchlists(user_id: int, db: Session = Depends(get_db)):
             w_items.append({"id": item.id, "ticker": item.ticker, "price": p_data["price"], "variation": p_data["variation"]})
         w_items.sort(key=lambda x: x["variation"], reverse=True)
         result.append({"id": w.id, "name": w.name, "items": w_items})
-        
     return result
 
 @app.post("/watchlists/")
@@ -174,7 +189,6 @@ def delete_watchlist(id: int, db: Session = Depends(get_db)):
 
 @app.post("/watchlists/{id}/items")
 def add_watchlist_item(id: int, item: WatchlistItemCreate, db: Session = Depends(get_db)):
-    # CORREÇÃO: Respeita o ticker enviado sem forçar o .SA (Permite adicionar ativos americanos e criptos)
     clean_ticker = item.ticker.upper().strip()
     existing = db.query(WatchlistItemDB).filter(WatchlistItemDB.watchlist_id == id, WatchlistItemDB.ticker == clean_ticker).first()
     if not existing:
@@ -326,7 +340,6 @@ def price_check(ticker: str, date: str):
 
 @app.get("/earnings")
 def get_earnings(wallet_id: int, db: Session = Depends(get_db)):
-    # Blinda o backend para não devolver falha caso o Yfinance não ache os dados
     default_res = {"total_acumulado": 0, "historico_mensal": [], "por_ativo": [], "por_classe": [], "detalhes": [], "provisionados": []}
     trans = db.query(TransactionDB).filter(TransactionDB.wallet_id == wallet_id).all()
     if not trans: return default_res
@@ -392,9 +405,7 @@ def get_earnings(wallet_id: int, db: Session = Depends(get_db)):
         t_list = sorted([{"name": k.replace('.SA',''), "value": safe_float(v)} for k,v in by_ticker.items()], key=lambda x:x["value"], reverse=True)
         c_list = sorted([{"name": k, "value": safe_float(v)} for k,v in by_class.items()], key=lambda x:x["value"], reverse=True)
         return {"total_acumulado": safe_float(total_recebido), "historico_mensal": hist, "por_ativo": t_list, "por_classe": c_list, "detalhes": detalhes, "provisionados": provisionados}
-    except Exception as e:
-        print("Erro Earnings:", e)
-        return default_res
+    except: return default_res
 
 @app.get("/dashboard")
 def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
@@ -508,9 +519,7 @@ def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
                     chart_data.append({"name": ts.strftime("%d/%m/%y"), "carteira": safe_float(rent_cart), "ibov": safe_float(rent_ibov), "cdi": safe_float((cdi_acc - 1) * 100), "ipca": safe_float((ipca_acc - 1) * 100)})
 
         return {"patrimonio_atual": safe_float(round(patrimonio_total, 2)), "total_investido": safe_float(round(investido_total, 2)), "lucro": safe_float(round(lucro, 2)), "rentabilidade_pct": safe_float(round(rent_total, 2)), "daily_variation": safe_float(round(daily_pct, 2)), "grafico": chart_data, "ativos": ativos_finais}
-    except Exception as e:
-        print("Erro Dashboard:", e)
-        return default_res
+    except: return default_res
 
 @app.get("/market-overview")
 def market_overview():
@@ -532,7 +541,6 @@ def market_overview():
         for category, tickers in baskets.items():
             cat_data = []
             prefix = "US$ " if "EUA" in category or "Cripto" in category else "R$ "
-            
             for t in tickers:
                 try:
                     if t in close_df.columns:
@@ -547,8 +555,7 @@ def market_overview():
             cat_data.sort(key=lambda x: x['variation'], reverse=True)
             results[category] = cat_data[:5]
         return results
-    except Exception as e:
-        return {k: [] for k in baskets.keys()}
+    except: return {k: [] for k in baskets.keys()}
 
 @app.get("/asset-details/{ticker}")
 def get_asset_details(ticker: str):
