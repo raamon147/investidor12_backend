@@ -5,8 +5,10 @@ import yfinance as yf
 import pandas as pd
 import math
 import hashlib
+import base64
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Float, Date, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
@@ -51,6 +53,12 @@ class TransactionDB(Base):
     price = Column(Float)
     type = Column(String)
 
+# --- NOVA TABELA: LOGOS PERSONALIZADAS ---
+class LogoDB(Base):
+    __tablename__ = "logos"
+    ticker = Column(String, primary_key=True, index=True)
+    image_base64 = Column(String) # Guarda a imagem convertida em texto
+
 Base.metadata.create_all(bind=engine)
 
 class UserAuth(BaseModel):
@@ -69,6 +77,10 @@ class TransactionCreate(BaseModel):
     quantity: float
     price: float
     type: str
+
+class LogoCreate(BaseModel):
+    ticker: str
+    image_base64: str
 
 app = FastAPI(title="Investidor12 API")
 
@@ -120,6 +132,36 @@ def get_divs_sync(ticker):
 
 @app.get("/")
 def read_root(): return {"status": "API Investidor12 Online"}
+
+# --- ROTAS DE LOGO ---
+@app.post("/logos/")
+def upload_logo(logo: LogoCreate, db: Session = Depends(get_db)):
+    ticker_clean = logo.ticker.upper().strip().replace('.SA', '')
+    db_logo = db.query(LogoDB).filter(LogoDB.ticker == ticker_clean).first()
+    if db_logo:
+        db_logo.image_base64 = logo.image_base64
+    else:
+        db_logo = LogoDB(ticker=ticker_clean, image_base64=logo.image_base64)
+        db.add(db_logo)
+    db.commit()
+    return {"message": "Logo salva com sucesso!"}
+
+@app.get("/logos/{ticker}")
+def get_logo(ticker: str, db: Session = Depends(get_db)):
+    ticker_clean = ticker.upper().strip().replace('.SA', '')
+    db_logo = db.query(LogoDB).filter(LogoDB.ticker == ticker_clean).first()
+    
+    if not db_logo or not db_logo.image_base64:
+        raise HTTPException(status_code=404, detail="Logo não encontrada no banco")
+    
+    try:
+        # Separa o cabeçalho (ex: data:image/png;base64) dos dados reais
+        header, encoded = db_logo.image_base64.split(",", 1)
+        file_ext = header.split(";")[0].split("/")[1]
+        data = base64.b64decode(encoded)
+        return Response(content=data, media_type=f"image/{file_ext}")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Erro ao decodificar imagem")
 
 @app.post("/auth/register")
 def register(user: UserAuth, db: Session = Depends(get_db)):
@@ -425,7 +467,6 @@ def get_dashboard(wallet_id: int, db: Session = Depends(get_db)):
 
     return {"patrimonio_atual": safe_float(round(patrimonio_total, 2)), "total_investido": safe_float(round(investido_total, 2)), "lucro": safe_float(round(lucro, 2)), "rentabilidade_pct": safe_float(round(rent_total, 2)), "daily_variation": safe_float(round(daily_pct, 2)), "grafico": chart_data, "ativos": ativos_finais}
 
-# --- NOVA ROTA: PANORAMA DO MERCADO ---
 @app.get("/market-overview")
 def market_overview():
     baskets = {
@@ -471,8 +512,6 @@ def market_overview():
         print("Erro Panorama:", e)
         return {k: [] for k in baskets.keys()}
 
-
-# --- CORREÇÃO DO CÁLCULO DE DY ---
 @app.get("/asset-details/{ticker}")
 def get_asset_details(ticker: str):
     ticker_upper = ticker.upper().strip()
@@ -488,7 +527,6 @@ def get_asset_details(ticker: str):
         if not info or ('regularMarketPrice' not in info and 'currentPrice' not in info and 'previousClose' not in info):
              raise HTTPException(status_code=404, detail="Ativo não encontrado.")
 
-        # 1. Gráfico de Preço (1 Ano)
         hist = t.history(period="1y")
         chart_data = []
         current_price = 0
@@ -500,7 +538,6 @@ def get_asset_details(ticker: str):
         if current_price == 0:
             current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
 
-        # 2. Histórico de Dividendos
         divs = t.dividends
         div_history = []
         upcoming_divs = []
@@ -524,12 +561,10 @@ def get_asset_details(ticker: str):
             
         div_chart = [{"mes": k, "valor": safe_float(v)} for k, v in div_chart_map.items()]
 
-        # 3. Matemática Correta do DY (Impede que 7.79 vire 779%)
         dy = safe_float(info.get("dividendYield", info.get("trailingAnnualDividendYield", 0)))
         if dy > 0:
-            dy = dy * 100 if dy < 1 else dy # Se for 0.07, vira 7%. Se a API mandar 7.0, mantem 7%.
+            dy = dy * 100 if dy < 1 else dy
         else:
-            # Fallback manual restrito aos ultimos 12 meses EXATOS
             if current_price > 0 and div_history:
                 hoje = datetime.now()
                 um_ano_atras = hoje - timedelta(days=365)
